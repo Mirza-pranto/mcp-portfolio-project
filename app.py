@@ -9,8 +9,11 @@ from groq import Groq
 
 # 1. Setup Groq API Key
 if "GROQ_API_KEY" not in os.environ:
-    # Replace the string below with your actual Groq API key
-    os.environ["GROQ_API_KEY"] = "REDACTED_GROQ_API_KEY"
+    # Do not hardcode secrets here. Set it in your terminal before running streamlit:
+    # PowerShell: $env:GROQ_API_KEY="your_new_key_here"
+    pass
+
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 client = Groq()
 
