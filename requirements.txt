@@ -1,0 +1,5 @@
+fastmcp
+streamlit
+groq
+pillow
+pydantic
