@@ -12,6 +12,8 @@ from groq import Groq
 from audio_recorder_streamlit import audio_recorder
 from gtts import gTTS
 from supabase import create_client
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 
 # Propagate Supabase secrets into the process environment so the MCP server can access them.
 if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
@@ -32,6 +34,12 @@ env_status = {
     "SUPABASE_KEY": "SUPABASE_KEY" in os.environ,
 }
 st.write(f"Debug: SUPABASE_URL set = {env_status['SUPABASE_URL']}, SUPABASE_KEY set = {env_status['SUPABASE_KEY']}")
+
+
+@st.cache_resource
+def load_embedder():
+    """Caches the embedding model so it doesn't reload on every UI click."""
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 # 1. Setup Groq API Key
 try:
@@ -151,6 +159,20 @@ support_tools = [
     {
         "type": "function",
         "function": {
+            "name": "search_knowledge_base",
+            "description": "Searches the company's internal IT knowledge base for troubleshooting steps, setup guides, and policies. Always use this BEFORE searching the public web.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query based on the user's issue."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Search the web using DuckDuckGo to find real-time information, technical documentation, or troubleshooting guides.",
             "parameters": {
@@ -197,7 +219,7 @@ if "is_voice_input" not in st.session_state:
 
 if "is_agent" not in st.session_state:
     st.session_state.is_agent = False
-
+    
 with st.sidebar:
     st.markdown("### Controls")
     if st.button("Clear Chat"):
@@ -234,7 +256,7 @@ with st.sidebar:
             else:
                 st.error("Invalid PIN.")
                 
-    # If logged in, show the Live Ticket Queue
+    # If logged in, show Ticket Queue and Knowledge Base tools
     else:
         if st.button("Log Out Agent"):
             st.session_state.is_agent = False
@@ -246,15 +268,12 @@ with st.sidebar:
             
         if supabase_client:
             try:
-                # Fetch the latest 10 open tickets
                 res = (supabase_client.table("tickets")
                        .select("id, status, description, user_email")
                        .order("id", desc=True)
                        .limit(10)
                        .execute())
-                
                 if res.data:
-                    # Display as a clean, interactive dataframe
                     st.dataframe(res.data, use_container_width=True, hide_index=True)
                 else:
                     st.caption("No active tickets found.")
@@ -262,6 +281,87 @@ with st.sidebar:
                 st.caption(f"Unable to load queue: {e}")
         else:
             st.error("Database connection missing.")
+            
+        st.divider()
+
+        # --- Manage & Delete Knowledge Base Articles ---
+        st.markdown("### 🗑️ Manage Knowledge Base")
+        
+        if supabase_client:
+            try:
+                # Fetch all KB articles to display in the dropdown
+                kb_res = (supabase_client.table("kb_articles")
+                          .select("id, title")
+                          .order("id", desc=True)
+                          .execute())
+                
+                if kb_res.data:
+                    # Create a dictionary to map the display name to the database ID
+                    kb_options = {f"[{item['id']}] {item['title']}": item['id'] for item in kb_res.data}
+                    
+                    selected_article = st.selectbox(
+                        "Select a document chunk to remove:", 
+                        options=list(kb_options.keys())
+                    )
+                    
+                    if st.button("Delete Selected"):
+                        article_id = kb_options[selected_article]
+                        # Delete the specific row from Supabase
+                        supabase_client.table("kb_articles").delete().eq("id", article_id).execute()
+                        st.success(f"✅ Deleted {selected_article}")
+                        st.rerun() # Refresh the UI immediately
+                else:
+                    st.caption("Knowledge base is currently empty.")
+            except Exception as e:
+                st.caption(f"Unable to load KB articles: {e}")    
+
+        st.divider()
+
+        # --- Knowledge Base Uploader ---
+        st.markdown("### 📚 Update Knowledge Base")
+        uploaded_kb_files = st.file_uploader("Upload IT Manuals", type=["pdf", "txt"], accept_multiple_files=True)
+        
+        if st.button("Ingest Files") and uploaded_kb_files:
+            with st.spinner("Extracting and embedding documents..."):
+                embedder = load_embedder()
+                
+                for file in uploaded_kb_files:
+                    text_content = ""
+                    
+                    # Extract text based on file type
+                    if file.name.endswith(".txt"):
+                        text_content = file.getvalue().decode("utf-8")
+                    elif file.name.endswith(".pdf"):
+                        reader = PdfReader(file)
+                        for page in reader.pages:
+                            text_content += page.extract_text() + "\n"
+                            
+                    # Clean up spacing
+                    text_content = text_content.strip()
+                    if not text_content:
+                        continue
+                        
+                    # Chunk the text into ~1000 character segments
+                    chunk_size = 1000
+                    chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+                    
+                    for i, chunk in enumerate(chunks):
+                        if not chunk.strip(): 
+                            continue
+                            
+                        # Generate vector embedding for the chunk
+                        embedding = embedder.encode(chunk).tolist()
+                        
+                        # Insert into Supabase
+                        supabase_client.table("kb_articles").insert({
+                            "title": f"{file.name} (Part {i+1})",
+                            "content": chunk,
+                            "embedding": embedding
+                        }).execute()
+                        
+                st.success("✅ Files successfully processed and added to the Knowledge Base!")
+                st.rerun() # Refreshes sidebar so new items show up in the Delete dropdown right away
+
 
 def render_message_content(content):
     if isinstance(content, str):
@@ -393,10 +493,12 @@ if active_input is not None:
                         "content": mcp_output,
                     })
 
-                    if isinstance(mcp_output, str) and mcp_output.startswith("ERROR:"):
-                        st.error(f"⚠️ **MCP Server Error:**\n\n{mcp_output}")
-                    else:
-                        st.success(f"✅ **MCP Server Output:**\n\n{mcp_output}")
+                    # AFTER (Collapses raw debug data into a dropdown):
+                    with st.expander(f"🔍 Developer Logs: Raw MCP Output ({tool_name})"):
+                        if isinstance(mcp_output, str) and mcp_output.startswith("ERROR:"):
+                            st.error(mcp_output)
+                        else:
+                            st.code(mcp_output)
 
                 follow_up_response = client.chat.completions.create(
                     model=VISION_MODEL,

@@ -1,0 +1,387 @@
+================================================================================
+                    QUANTUMFORGE INDUSTRIES
+         INTERNAL IT SUPPORT & STANDARD OPERATING PROCEDURES (SOP) MANUAL
+================================================================================
+
+Document Control Number: QF-IT-MAN-001-REV-12.4
+Classification: INTERNAL / CONFIDENTIAL
+Date of Issue: June 1, 2026
+Next Scheduled Review: December 1, 2026
+Primary Author: Dr. Aris Thorne, Senior Director of IT Infrastructure
+Approved By: The Quantum Oversight Committee
+
+--------------------------------------------------------------------------------
+PREAMBLE
+--------------------------------------------------------------------------------
+This document serves as the singular source of truth for all Information Technology
+operations, support procedures, and standard operating protocols within QuantumForge
+Industries (QFI). All IT staff, System Administrators, and Helpdesk personnel are
+legally and contractually obligated to adhere to the specifications contained herein.
+Deviations from these protocols must be submitted via the Proton Deviation Request
+Form (QF-FRM-889) and approved by the Tier-5 Systems Architecture Board.
+
+--------------------------------------------------------------------------------
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. Corporate Network & VPN Setup
+2. Custom Software Troubleshooting (Chronos Sync, Plasma-DB, Forge-Script Compiler)
+3. Hardware Procurement & Lifecycle Management
+4. Security & Access Control Protocols
+5. New Hire Onboarding & Offboarding Checklists
+6. Appendix: Physical Infrastructure & Cabling
+
+================================================================================
+SECTION 1: CORPORATE NETWORK & VPN SETUP
+================================================================================
+
+1.1 Network Topology Overview
+QuantumForge operates on a Zero-Trust, Micro-segmented network architecture. The
+internal backbone operates on a 400Gbps Quantum-Encrypted Backbone (QEB). Routing is
+managed via the "Hermes-NX" routing clusters.
+
+1.1.1 Internal Domain Structure
+- Primary Internal Domain: quantumforge.internal
+- Secondary (Legacy) Domain: qfi.corp
+
+1.1.2 Departmental Subnets (IPv4)
+All traffic is routed through the central "Chronos Gateways." The following subnets
+are reserved and strictly enforced via VLAN tagging:
+
+Department              Subnet              VLAN ID     Gateway Address
+-----------------------------------------------------------------------
+Quantum R&D (Q-RD)      10.48.12.0/24       101         10.48.12.1
+Plasma Engineering (PE) 10.48.13.0/24       102         10.48.13.254
+Corporate Finance (CF)  10.48.20.0/24       201         10.48.20.1
+HR & Admin (HR)         10.48.25.0/24       205         10.48.25.253
+Data Center Ops (DCO)   10.50.5.0/26        501         10.50.5.62
+Guest/BYOD              192.168.71.0/24     999         192.168.71.1
+
+NOTE: The 10.50.x.x range is strictly reserved for physical infrastructure
+management (iDRAC, PDUs, Environmental Sensors).
+
+1.2 VPN Setup: Aegis-Link Client
+Remote access is secured exclusively via the proprietary Aegis-Link Client v.4.2.6.
+This client uses a double-wrapped TLS 1.3 tunnel over a UDP quantum-resistant
+handshake (Kyber-768).
+
+1.2.1 Aegis-Link Installation Paths
+- Windows: C:\Program Files\QuantumForge\Aegis-Link\aegis.exe
+- macOS: /Applications/QuantumForge/Aegis-Link.app
+
+1.2.2 Primary and Failover Gateways
+End-users must connect to the geographic cluster closest to their operational zone.
+The Client must be configured with the following FQDNs and their corresponding
+secondary IPs for failover:
+
+Cluster Name   Primary FQDN                              Primary IP      Failover FQDN                 Failover IP       Port
+-------------------------------------------------------------------------------------------------------------------------------
+Atlantis (NA)  vpn.atlantis.quantumforge.internal        172.21.100.50   vpn-na-fail.qfi.net           198.51.100.27     UDP 4500
+Elysium (EU)   vpn.elysium.quantumforge.internal         172.21.200.50   vpn-eu-fail.qfi.net           203.0.113.89      UDP 4500
+Shambhala (APAC) vpn.shambhala.quantumforge.internal     172.21.300.50   vpn-apac-fail.qfi.net         203.0.113.12      UDP 4500
+
+1.2.3 Authentication Factors
+Login requires a Three-Factor Authentication stack:
+Factor 1: AD/LDAP username and 12-character password.
+Factor 2: Hardware Q-Token (see Section 4.3) generating a rotating 8-digit code.
+Factor 3: Certificate thumbprint validation from the machine's TPM 2.0 chip.
+
+1.3 DNS Configuration
+Internal DNS resolution is handled by the "Oracle-NX" cluster. Endpoints must point to:
+- Primary: dns1.quantumforge.internal (IP: 172.16.1.10)
+- Secondary: dns2.quantumforge.internal (IP: 172.16.1.11)
+
+Critical SRV Records:
+- _ldap._tcp.dc._msdcs.quantumforge.internal -> Points to dc01.quantumforge.internal:389
+- _kerberos._tcp.quantumforge.internal -> Points to krb01.quantumforge.internal:88
+
+================================================================================
+SECTION 2: CUSTOM SOFTWARE TROUBLESHOOTING
+================================================================================
+
+QuantumForge operates three proprietary mission-critical software suites. The
+following sections detail the specific error codes and remediation paths for each.
+
+2.1 Chronos Sync Utility (CSU)
+Purpose: Bi-directional synchronization of local ephemeral storage with the central
+Plasma-DB clusters. Used primarily by R&D for simulation state saves.
+
+Critical Error Codes & Procedures:
+
+ERROR CSU-ALPHA-9: Temporal Integrity Hash Mismatch
+- Cause: The SHA-1024 hash of the delta snapshot does not match the expected Merkle
+  root stored on the Master node.
+- Solution:
+  1. Stop the CSU service immediately (net stop ChronosSync).
+  2. Navigate to the local cache: C:\ChronosCache\Pending\.
+  3. Delete the .delta file with the timestamp of the failure.
+  4. Run the "Integrity Checker" utility located at C:\ChronosSync\bin\checker.exe /force /repair.
+  5. Restart the service and initiate a "Full Pull" rather than a delta sync using the /fullsync switch.
+
+ERROR CSU-BETA-7: Orphaned Lock File (Olf)
+- Cause: The .lck file was not purged due to a process termination, preventing new
+  synchronization threads from spawning.
+- Solution:
+  1. Identify the Process ID (PID) holding the lock using handle.exe -a -p ChronosSync.
+  2. If the PID does not exist, manually navigate to \\plasma-nas\global_locks\ and
+     delete the specific sync_lock_<UUID>.lck file.
+  3. Restart the Chronos Orchestrator service.
+
+ERROR CSU-GAMMA-2: Quantum Entanglement Timeout (QET)
+- Cause: Network latency exceeds the 15ms window required for quantum synchronization,
+  usually caused by routing loops.
+- Solution:
+  1. Run a traceroute to plasma-master.quantumforge.internal.
+  2. If hops exceed 12, escalate to Network Operations to check the "Hermes-NX" route tables.
+  3. Increase the "Slack Time" variable in the csu_config.ini from 15 to 25 (temporary fix).
+  4. Reboot the local Aegis-Link tunnel service.
+
+ERROR CSU-DELTA-9: Archive Index Corruption
+- Cause: The .idx file for the monthly archive contains invalid byte offsets.
+- Solution: Run the external "Chronos Rescue" toolkit.
+  Syntax: chronos_rescue.exe /restore_idx /date=YYYY-MM-DD /output=local.
+
+ERROR CSU-EPSILON-5: Insufficient Entropy
+- Cause: The random number generator on the client machine has insufficient entropy
+  to generate the sync seed.
+- Solution: Open a command prompt as Administrator and run
+  certutil -setreg -user \Software\Microsoft\Cryptography\Entropy\ForceNewSeed 1.
+
+-------------------------------------------------------------------------------
+
+2.2 Plasma-DB Manager (PDM)
+Purpose: In-memory columnar database engine for processing high-velocity time-series
+data.
+
+Critical Error Codes & Procedures:
+
+ERROR PDM-442: Node Partitioning Split-Brain (NP-SB)
+- Cause: The heartbeat between Node A and Node B dropped, causing both to assume
+  Primary leadership.
+- Solution:
+  1. Identify the current "epoch" number in the logs.
+  2. Shut down the secondary node (net stop PlasmaDB).
+  3. Delete the .epoch file from the data directory (D:\PlasmaData\conf\).
+  4. Restart the secondary node; it will force a full resync from the primary arbiter.
+
+ERROR PDM-511: Memory Allocation Poisoning (MAP)
+- Cause: A memory block was overwritten by the "Garbage Collector" before the write
+  transaction committed.
+- Solution: Increase the Heap allocation in the startup script from -Xmx64G to
+  -Xmx96G. If that fails, run the "Heap Dump Analyzer" located at
+  C:\PDM\bin\analyzer.jar with the -clear_poison flag.
+
+ERROR PDM-722: Vector Clock Desync (VCD)
+- Cause: The logical vector clock in the APAC region is lagging behind the Elysium
+  cluster by more than 100 logical ticks.
+- Solution: Force a "Clock Jump" via the administrative console:
+  pdm_admin --region=APAC --force-vector-update --source=ELYSIUM.
+
+ERROR PDM-899: Hybrid Logical Clock Rollback
+- Cause: Physical system time was adjusted backwards by the Hypervisor.
+- Solution: Disable NTP synchronization on the VM temporarily. Run
+  pdm_admin --reset-hlc. Re-enable NTP and restart the PDM listener service.
+
+ERROR PDM-999: Columnar Schema Mutation Conflict (CSMC)
+- Cause: An attempt to add a new column to the "Fluctuations" table while a rollback
+  transaction was pending.
+- Solution: Execute the "Schema Reconciliation" script:
+  schema_reconcile.ps1 -table Fluctuations -mutation_id <ID> -force_commit.
+
+-------------------------------------------------------------------------------
+
+2.3 Forge-Script Compiler (FSC)
+Purpose: Translating proprietary Quantum Assembly Language (QAL) into machine code
+for the "Titan-F" accelerator cards.
+
+Critical Error Codes & Procedures:
+
+ERROR FSC-001: Neutrino Flow Overrun
+- Cause: Too many concurrent threads attempting to write to the instruction pipeline.
+- Solution: Decrease the thread_pool parameter in the compiler flags from 32 to 16.
+  Clean the build cache: fsc --clean-cache --path=C:\FSC\Cache.
+
+ERROR FSC-404: Missing Manifest for Quantum State (MQS)
+- Cause: The state.manifest file is missing the entanglement vector for a specific Qubit.
+- Solution: Generate a dummy manifest using fsc --gen-manifest --qubits=64 and then
+  manually merge the missing vector using the "Vector Merger" GUI.
+
+ERROR FSC-777: Phase Shift Mismatch (PSM)
+- Cause: The compiler attempted to optimize a gate sequence but lost coherence due
+  to the phase angle being out of the -π to π range.
+- Solution: Run the compiler with the --no-optimize flag to bypass the optimizer.
+  If necessary, adjust the phase_tolerance in fsc.config to 0.98.
+
+ERROR FSC-808: Silicon Stack Overflow (SSO)
+- Cause: The stack pointer on the Titan-F card exceeded its allocated 512MB limit.
+- Solution: The code must be refactored. For an immediate fix, increase the stack
+  allocation using the linker flag: /STACK:1048576000. Reset the Titan-F card using
+  the physical reset switch on rack unit 4.
+
+ERROR FSC-909: Qubit Leakage
+- Cause: A qubit state was lost due to thermal noise exceeding 15 Kelvin.
+- Solution: Check the cryo-coolant levels in the Titan-F rack. If levels are optimal,
+  run the "Leakage Dampener" script: fsc --dampen-leakage --iteration=5.
+
+================================================================================
+SECTION 3: HARDWARE PROCUREMENT & LIFECYCLE
+================================================================================
+
+3.1 Asset Classification & Tiering
+Hardware is classified into Tiers based on job role. These classifications dictate
+brand, model, specifications, and lifespan.
+
+TIER-1: Executive/C-Suite
+- Standard Model: ZenBook Quantum X-3
+- Specs: OLED 8K, Intel Xeon W-3395, 256GB RAM, 4TB NVMe
+- Replacement Cycle: 18 Months
+
+TIER-2: Senior Engineers/Architects
+- Standard Model: Q-Prime Laptop Z7
+- Specs: 4K HDR, AMD Threadripper Pro, 128GB RAM, 2TB NVMe
+- Replacement Cycle: 24 Months
+
+TIER-3: Staff/General Developers
+- Standard Model: ChronosBook C5
+- Specs: 1080p, Intel Core i7-15700H, 32GB RAM, 1TB SSD
+- Replacement Cycle: 36 Months
+
+TIER-4: Interns/Temp Staff
+- Standard Model: Legacy Carbon C2
+- Specs: 1080p, Intel Core i5, 16GB RAM, 512GB SSD
+- Replacement Cycle: 48 Months
+
+3.2 Procurement Approval Chain (PAC)
+The procurement of new hardware is subject to the "Quantum Flow" approval matrix.
+
+Step 1 - Requestor: Submits a formal request via the "Hermes Portal" using Form QF-FRM-101.
+Step 2 - Department Head (DH): Approves the budgetary allocation. Must include a
+        cost center string (e.g., CC-8930-RD).
+Step 3 - IT Asset Manager (IAM): Checks the current inventory levels in the "Golem
+        Warehouse" system.
+        - If stock is available: Assigned immediately.
+        - If stock is unavailable: Requires escalation to Level 4.
+Step 4 - Level 4 - Procurement Director: Signs off on the Purchase Order (PO).
+Step 5 - Quantum Oversight Committee (QOC): Only required if the total cost exceeds $50,000.
+
+3.3 Decommissioning & Disposal (E-Waste Protocol)
+When a device reaches End-of-Life (EOL):
+1. The user backs up data to \\plasma-backup\userprofiles\.
+2. IT executes the "Scorched Earth" script: wipe_drive.exe /method=DoD_5220.22-M /passes=7.
+3. The physical Hard Drive (or SSD chip) is physically drilled through the center
+   (3mm bit) in the presence of an IT witness.
+4. The Asset Tag is scanned into the "Disposal Log" and the MAC address is permanently
+   blocked from the DHCP pool.
+
+================================================================================
+SECTION 4: SECURITY & ACCESS CONTROL PROTOCOLS
+================================================================================
+
+4.1 Physical Security (Badge Readers)
+Entry and exit through QuantumForge facilities are monitored by the "Argus" security
+system. Badge readers are located at specific checkpoints. All Access Control Lists
+(ACLs) are managed via the Argus-Admin dashboard.
+
+Badge Reader Locations & Designations:
+------------------------------------------------------------
+Reader ID     Location Description                      Security Level Required
+ARG-01        Main Lobby Turnstile (North)              Level 1 (Basic)
+ARG-12        Server Rack Corridor 4 (East Wing)        Level 5 (Top Secret)
+ARG-27        Plasma Lab "Clean Room" Antechamber       Level 6 (Graviton Clearance)
+ARG-44        Basement Level 3 - "The Vault"            Level 10 (Singularity Clearance)
+
+Protocol: "Tailgating" Detection
+- If a badge is swiped twice within a 3-second window at the same reader, the Argus
+  system automatically locks the door and triggers a silent alarm to the Quantum
+  Security Team.
+
+4.2 Wi-Fi Access & Password Rotation
+The primary internal Wi-Fi uses WPA3-Enterprise with 802.1X authentication
+(Certificate-based). Guest Wi-Fi uses WPA2-Personal with a rotating passphrase.
+
+- Internal SSID: QFI-Secure-NX
+- Guest SSID: QFI-Guest-Quantum
+
+Guest Password Rotation Schedule (Mandatory):
+The guest password is generated weekly using a deterministic algorithm seeded by the
+current Unix timestamp.
+
+Week 23 (Jun 1 - Jun 7):   QFI_Guest_9x4$23#qR
+Week 24 (Jun 8 - Jun 14):  QFI_Guest_7v2@44!tG
+Week 25 (Jun 15 - Jun 21): QFI_Guest_8z1%55^hJ
+
+NOTE: Passwords are pushed automatically to the guest portal every Monday at 06:00 UTC.
+
+4.3 Lost 2FA Tokens ("Q-Tokens")
+The Physical 2FA tokens are known as Q-Tokens (Model: YubiKey NEO-NX). They are
+serialized and bound to the user's identity.
+
+Protocol for Lost Q-Tokens:
+1. The user must immediately report the loss via the "Emergency Token Deactivation"
+   hotline (Ext. 9111).
+2. The IT Security Admin initiates a "Global Logout" for the user account on the
+   Aegis-Link VPN to prevent concurrent sessions.
+3. The Admin revokes the token's Certificate Serial Number (CSN) in the Certificate
+   Revocation List (CRL).
+4. The user must physically report to the "Secure Enclave" (Room 101B) with a Photo
+   ID to receive a new token. A replacement fee of $450 is charged to the Department
+   Cost Center.
+5. The new token must be manually paired using the token-pair.exe utility, which
+   requires a one-time 64-character seed displayed only by the Security Admin.
+
+================================================================================
+SECTION 5: ONBOARDING & OFFBOARDING CHECKLISTS
+================================================================================
+
+5.1 New Hire IT Onboarding Checklist
+This must be completed within 4 hours of the employee's official start time.
+
+[ ] Account Creation: Generate User Principal Name (UPN):
+    firstname.lastname@quantumforge.internal. Assign to appropriate Security Groups
+    (e.g., DL-RD-Engineers).
+[ ] Hardware Issuance: Issue Tier-specific laptop. Ensure BIOS is flashed to version 3.1.2_NX.
+[ ] Aegis-Link VPN: Install client. Generate unique machine certificate via the PKI
+    server (pki.quantumforge.internal).
+[ ] Peripheral Setup: Assign a "Q-Token" (see Section 4.3) and a Plantronics C-720 headset.
+[ ] Software Deployment: Push the base software stack via SCCM (Chronos Sync,
+    Plasma-DB Viewer, Office 365, Forge-Script IDE).
+[ ] VoIP Setup: Provision extension number in the 5000 range (e.g., 5XXX). Assign a
+    physical Cisco IP Phone 8851.
+[ ] Training: The user must complete "Security Awareness Module 1" before being
+    granted network access.
+
+5.2 Employee Offboarding Checklist (Termination/Layoff)
+This protocol must be initiated within 15 minutes of notification of termination by HR.
+
+[ ] Access Revocation: Disable AD Account immediately. This automatically revokes
+    the Aegis-Link VPN access.
+[ ] Token Revocation: Revoke the "Q-Token" via the CRL.
+[ ] Data Transfer: Grant the Manager (or designated successor) access to the user's
+    Documents and Desktop folders via the Network Security Drops.
+[ ] Mobile Device: Remotely wipe the corporate mobile device (iPhone 15 Pro) using
+    the Intune portal. If an Android device, issue a "Factory Reset" command.
+[ ] Hardware Retrieval: Schedule an IT Technician to retrieve the laptop, docking
+    station, and monitors within 2 hours. The laptop is to be held in "Quarantine"
+    for 7 days before wiping.
+
+================================================================================
+SECTION 6: APPENDIX - PHYSICAL INFRASTRUCTURE & CABLING
+================================================================================
+
+6.1 Rack Layout Standard (Rack Unit 1-10)
+In the "Athena" Data Center (Aisle 4, Row B):
+- U1-U4: Compute Nodes (Titan-F Cards).
+- U5-U6: Top-of-Rack (ToR) Switches (Juniper QFX5220).
+- U7: KVM Console Drawer.
+- U8: UPS PDU (Power Distribution Unit) - Input voltage 415V.
+
+6.2 Cable Color Coding (International Standard)
+Cable colors indicate the type and speed of the network connection to prevent
+mis-routing.
+- Orange:  10GBase-T Ethernet (Copper).
+- Blue:    40GBase-SR4 Fiber Optics (OM4).
+- Yellow:  100GBase-LR4 Fiber Optics (Single Mode).
+- Black:   Management/Ethernet (1Gbps).
+
+================================================================================
+END OF DOCUMENT
+================================================================================

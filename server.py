@@ -4,6 +4,7 @@ from fastmcp import FastMCP
 from mcp.server.fastmcp import Context
 from supabase import create_client
 from duckduckgo_search import DDGS
+from sentence_transformers import SentenceTransformer
 
 # Initialize the MCP Server
 mcp = FastMCP("SupportTicketingSystem")
@@ -16,6 +17,36 @@ SUPABASE_URL = raw_url if raw_url else None
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+
+# Load the embedding model (downloads automatically the first time)
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
+@mcp.tool()
+def search_knowledge_base(query: str) -> str:
+    """Searches the internal IT knowledge base for guides, policies, and troubleshooting steps."""
+    try:
+        # Convert the text query into a vector embedding
+        query_embedding = embedder.encode(query).tolist()
+        
+        # Call the Supabase matching function
+        response = supabase.rpc("match_kb_articles", {
+            "query_embedding": query_embedding,
+            "match_threshold": 0.3, # Adjust between 0.0 and 1.0 for strictness
+            "match_count": 3
+        }).execute()
+        
+        if not response.data:
+            return "No relevant internal documentation found."
+            
+        # Format the results for the LLM
+        results = ["Here are the relevant internal documents:\n"]
+        for doc in response.data:
+            results.append(f"Title: {doc['title']}\nContent: {doc['content']}\nRelevance: {doc['similarity']:.2f}\n---")
+            
+        return "\n".join(results)
+    except Exception as e:
+        return f"ERROR searching knowledge base: {str(e)}"
 
 # Expose Tools via the @mcp.tool decorator
 @mcp.tool
