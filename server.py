@@ -40,26 +40,40 @@ def get_ticket_status(ticket_id: int, ctx: Context | None = None) -> str:
         return f"ERROR: Database lookup failed - {str(e)}"
 
 @mcp.tool
-def create_ticket(description: str, ctx: Context | None = None) -> str:
-    """Creates a new high-priority support ticket. Use this when the user reports a new critical bug."""
-    if ctx:
-        ctx.info("Starting ticket creation operation")
-
+def create_ticket(description: str, email: str, ctx: Context | None = None) -> str:
+    """Creates a new high-priority support ticket. Requires the user's email."""
     try:
-        if supabase is None:
-            raise RuntimeError("Supabase client is not configured. Set SUPABASE_URL and SUPABASE_KEY.")
-
-        response = supabase.table("tickets").insert({"status": "Open", "description": description}).execute()
+        response = supabase.table("tickets").insert({
+            "status": "Open", 
+            "description": description,
+            "user_email": email  # New column added here
+        }).execute()
+        
         new_id = response.data[0]["id"]
-
-        if ctx:
-            ctx.info(f"Ticket created successfully with ID {new_id}")
-        return f"Successfully created Ticket #{new_id}."
+        return f"Successfully created Ticket #{new_id} for {email}."
     except Exception as e:
-        if ctx:
-            ctx.error(f"Database insertion failed: {str(e)}")
         return f"ERROR: Database insertion failed - {str(e)}"
-
+    
+    
+@mcp.tool
+def get_user_tickets(email: str, ctx: Context | None = None) -> str:
+    """Retrieves all past and present support tickets for a specific user email."""
+    try:
+        response = supabase.table("tickets").select("id, status, description, created_at").eq("user_email", email).order("id", desc=True).execute()
+        
+        if not response.data:
+            return f"No previous tickets found for {email}."
+            
+        # Format the data nicely for the AI to read
+        formatted_history = f"Ticket History for {email}:\n"
+        for ticket in response.data:
+            formatted_history += f"- Ticket #{ticket['id']} ({ticket['status']}): {ticket['description']}\n"
+            
+        return formatted_history
+    except Exception as e:
+        return f"ERROR: Failed to fetch history - {str(e)}"
+    
+    
 @mcp.tool
 def get_recent_tickets(limit: int = 5, ctx: Context | None = None) -> str:
     """Retrieves a list of the most recent support tickets to summarize the current queue."""

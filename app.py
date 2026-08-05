@@ -111,9 +111,10 @@ support_tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string"}
+                    "description": {"type": "string"},
+                    "email": {"type": "string"}
                 },
-                "required": ["description"]
+                "required": ["description", "email"]
             }
         }
     },
@@ -136,6 +137,20 @@ support_tools = [
     {
         "type": "function",
         "function": {
+            "name": "get_user_tickets",
+            "description": "Retrieves all past and present support tickets for a specific user email.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email": {"type": "string"}
+                },
+                "required": ["email"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": "Search the web using DuckDuckGo to find real-time information, technical documentation, or troubleshooting guides.",
             "parameters": {
@@ -150,8 +165,32 @@ support_tools = [
 ]
 
 # 5. Streamlit UI Elements & State Initialization
+if "user_email" not in st.session_state:
+    st.session_state.user_email = None
+
+# --- NEW: The Login Wall ---
+if not st.session_state.user_email:
+    st.markdown("## 👋 Welcome to Omni-Support")
+    st.markdown("Please sign in to access your support history and create new tickets.")
+    
+    with st.form("login_form"):
+        email_input = st.text_input("Email Address", placeholder="name@company.com")
+        submit_btn = st.form_submit_button("Start Chat")
+        
+        if submit_btn and email_input:
+            st.session_state.user_email = email_input
+            st.rerun()
+            
+    st.stop() # This stops the rest of the app from loading until they log in!
+
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    # We inject a hidden system message so the AI knows who is logged in
+    st.session_state.messages = [
+        {
+            "role": "system", 
+            "content": f"You are a helpful IT support agent. You are talking to user: {st.session_state.user_email}. Always use this email when creating tickets or looking up their history."
+        }
+    ]
 
 if "is_voice_input" not in st.session_state:
     st.session_state.is_voice_input = False
@@ -162,7 +201,13 @@ if "is_agent" not in st.session_state:
 with st.sidebar:
     st.markdown("### Controls")
     if st.button("Clear Chat"):
-        st.session_state.messages = []
+        # Reset the chat but keep the user logged in
+        st.session_state.messages = [
+            {
+                "role": "system", 
+                "content": f"You are a helpful IT support agent. You are talking to user: {st.session_state.user_email}. Always use this email when creating tickets or looking up their history."
+            }
+        ]
         st.session_state.is_voice_input = False
         st.rerun()
         
@@ -191,7 +236,7 @@ with st.sidebar:
                 
     # If logged in, show the Live Ticket Queue
     else:
-        if st.button("Log Out"):
+        if st.button("Log Out Agent"):
             st.session_state.is_agent = False
             st.rerun()
             
@@ -203,7 +248,7 @@ with st.sidebar:
             try:
                 # Fetch the latest 10 open tickets
                 res = (supabase_client.table("tickets")
-                       .select("id, status, description")
+                       .select("id, status, description, user_email")
                        .order("id", desc=True)
                        .limit(10)
                        .execute())
@@ -235,7 +280,8 @@ def render_message_content(content):
                     st.image(image_url)
 
 for message in st.session_state.messages:
-    if message.get("role") == "tool":
+    # Skip rendering system messages and tool outputs in the main chat UI
+    if message.get("role") in ["tool", "system"]:
         continue
     with st.chat_message(message["role"]):
         render_message_content(message.get("content"))
