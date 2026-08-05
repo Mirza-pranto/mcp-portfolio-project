@@ -1,4 +1,3 @@
-import streamlit as st
 import os
 import asyncio
 import json
@@ -6,6 +5,8 @@ import base64
 import tempfile
 import io
 import re
+
+import streamlit as st
 from fastmcp import Client
 from fastmcp.client.transports import PythonStdioTransport
 from groq import Groq
@@ -34,7 +35,6 @@ env_status = {
     "SUPABASE_KEY": "SUPABASE_KEY" in os.environ,
 }
 st.write(f"Debug: SUPABASE_URL set = {env_status['SUPABASE_URL']}, SUPABASE_KEY set = {env_status['SUPABASE_KEY']}")
-
 
 @st.cache_resource
 def load_embedder():
@@ -205,12 +205,20 @@ if not st.session_state.user_email:
             
     st.stop() # This stops the rest of the app from loading until they log in!
 
+# Updated system prompt with explicit tool‑usage rules
+SYSTEM_PROMPT_TEMPLATE = (
+    "You are a helpful IT support agent. You are talking to user: {user_email}. "
+    "Always use this email when creating tickets or looking up their history.\n"
+    "Tool usage rules:\n"
+    "1. Always search the internal knowledge base first using `search_knowledge_base`.\n"
+    "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
+)
+
 if "messages" not in st.session_state:
-    # We inject a hidden system message so the AI knows who is logged in
     st.session_state.messages = [
         {
-            "role": "system", 
-            "content": f"You are a helpful IT support agent. You are talking to user: {st.session_state.user_email}. Always use this email when creating tickets or looking up their history."
+            "role": "system",
+            "content": SYSTEM_PROMPT_TEMPLATE.format(user_email=st.session_state.user_email)
         }
     ]
 
@@ -226,8 +234,8 @@ with st.sidebar:
         # Reset the chat but keep the user logged in
         st.session_state.messages = [
             {
-                "role": "system", 
-                "content": f"You are a helpful IT support agent. You are talking to user: {st.session_state.user_email}. Always use this email when creating tickets or looking up their history."
+                "role": "system",
+                "content": SYSTEM_PROMPT_TEMPLATE.format(user_email=st.session_state.user_email)
             }
         ]
         st.session_state.is_voice_input = False
@@ -417,14 +425,22 @@ elif user_input:
 else:
     active_input = None
 
-if active_input is not None:
-    if not active_input.strip() and uploaded_image is None:
+# Handle state where only an image is uploaded (without text)
+if active_input or uploaded_image:
+    
+    # Default text fallback if only an image is uploaded
+    active_text = active_input if active_input else ""
+    if not active_text.strip() and uploaded_image is None:
         st.warning("Please provide a text description, record audio, or upload a screenshot.")
         st.stop()
 
     content = []
-    if active_input:
-        content.append({"type": "text", "text": active_input})
+    
+    if active_text.strip():
+        content.append({"type": "text", "text": active_text})
+    elif uploaded_image:
+        # Provide the LLM with instructions if the user only provided an image
+        content.append({"type": "text", "text": "Please analyze this uploaded screenshot and assist me."})
 
     if uploaded_image is not None:
         base64_image = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
@@ -436,15 +452,23 @@ if active_input is not None:
     st.session_state.messages.append({"role": "user", "content": content})
 
     with st.chat_message("user"):
-        if active_input:
-            st.markdown(active_input)
+        if active_text:
+            st.markdown(active_text)
+        elif uploaded_image:
+            st.markdown("*Uploaded an image.*")
+            
         if uploaded_image is not None:
             st.image(uploaded_image)
 
-    VISION_MODEL = "qwen/qwen3.6-27b"
+    VISION_MODEL = "qwen/qwen3.6-27b" # Note: Ensure this model identifier matches Groq's exact current list!
 
     with st.spinner("Analyzing request and executing tools..."):
         try:
+            # ---- MULTI‑TURN TOOL EXECUTION LOOP ----
+            MAX_TURNS = 5
+            turn_count = 0
+
+            # Initial LLM call
             response = client.chat.completions.create(
                 model=VISION_MODEL,
                 messages=st.session_state.messages,
@@ -453,80 +477,93 @@ if active_input is not None:
                 temperature=0.0
             )
 
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
+            # We'll collect tool calls in this loop; final answer will be set when no tool_calls.
+            final_answer = None
 
-            if tool_calls:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": tool_call.id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_call.function.name,
-                                "arguments": tool_call.function.arguments,
-                            },
-                        }
-                        for tool_call in tool_calls
-                    ],
-                }
-                st.session_state.messages.append(assistant_message)
+            while turn_count < MAX_TURNS:
+                response_message = response.choices[0].message
+                tool_calls = response_message.tool_calls
 
-                with st.chat_message("assistant"):
-                    st.info("🛠️ Tool call requested")
+                if tool_calls:
+                    # 1. Append assistant message with tool_calls
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments,
+                                },
+                            }
+                            for tc in tool_calls
+                        ],
+                    }
+                    st.session_state.messages.append(assistant_msg)
 
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
+                    # Show a placeholder in the UI that tool calls are happening
+                    with st.chat_message("assistant"):
+                        st.info("🛠️ Tool call requested")
 
-                    st.info(f"🛠️ **Agent Decision:** Trigger tool `{tool_name}` with parameters `{tool_args}`")
+                    # 2. Execute each tool and append results
+                    for tool_call in tool_calls:
+                        tool_name = tool_call.function.name
+                        tool_args = json.loads(tool_call.function.arguments)
 
-                    with st.spinner(f"Executing `{tool_name}` on MCP Server..."):
-                        mcp_output = asyncio.run(execute_mcp_tool(tool_name, tool_args))
+                        st.info(f"🛠️ **Agent Decision:** Trigger tool `{tool_name}` with parameters `{tool_args}`")
 
-                    st.session_state.messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_name,
-                        "content": mcp_output,
-                    })
+                        with st.spinner(f"Executing `{tool_name}` on MCP Server..."):
+                            mcp_output = asyncio.run(execute_mcp_tool(tool_name, tool_args))
 
-                    # AFTER (Collapses raw debug data into a dropdown):
-                    with st.expander(f"🔍 Developer Logs: Raw MCP Output ({tool_name})"):
-                        if isinstance(mcp_output, str) and mcp_output.startswith("ERROR:"):
-                            st.error(mcp_output)
-                        else:
-                            st.code(mcp_output)
+                        # Safely convert tool responses to string to prevent API schema validation errors
+                        safe_mcp_output = str(mcp_output) if not isinstance(mcp_output, str) else mcp_output
 
-                follow_up_response = client.chat.completions.create(
-                    model=VISION_MODEL,
-                    messages=st.session_state.messages,
-                    tools=support_tools,
-                    tool_choice="auto",
-                    temperature=0.0
-                )
-                final_content = follow_up_response.choices[0].message.content or ""
-                st.session_state.messages.append({"role": "assistant", "content": final_content})
+                        st.session_state.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": safe_mcp_output,
+                        })
 
-                with st.chat_message("assistant"):
-                    st.markdown(final_content)
-                    if st.session_state.get("is_voice_input", False):
-                        with st.spinner("Generating voice response..."):
-                            audio_fp = generate_tts_audio(final_content)
-                            if audio_fp:
-                                st.audio(audio_fp, format="audio/mp3", autoplay=True)
-                        st.session_state.is_voice_input = False
+                        with st.expander(f"🔍 Developer Logs: Raw MCP Output ({tool_name})"):
+                            if isinstance(mcp_output, str) and mcp_output.startswith("ERROR:"):
+                                st.error(mcp_output)
+                            else:
+                                st.code(mcp_output)
+
+                    # 3. Next LLM call with the updated messages (including tool responses)
+                    response = client.chat.completions.create(
+                        model=VISION_MODEL,
+                        messages=st.session_state.messages,
+                        tools=support_tools,
+                        tool_choice="auto",
+                        temperature=0.0
+                    )
+                    turn_count += 1
+                    # Continue the loop to see if the LLM calls more tools
+
+                else:
+                    # No tool_calls → final answer ready
+                    final_answer = response_message.content or ""
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer})
+                    break
+
             else:
-                assistant_text = response_message.content or ""
-                st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+                # Loop ended because MAX_TURNS reached without a final answer
+                st.warning(f"⚠️ Reached maximum tool call turns ({MAX_TURNS}). Showing partial response.")
+                # Use the last response content if available, otherwise a fallback
+                final_answer = response_message.content if response_message.content else "Max turns reached without final answer."
+                st.session_state.messages.append({"role": "assistant", "content": final_answer})
 
+            # 4. Render the final assistant message (already appended) and handle TTS
+            if final_answer is not None:
                 with st.chat_message("assistant"):
-                    st.markdown(assistant_text)
+                    st.markdown(final_answer)
                     if st.session_state.get("is_voice_input", False):
                         with st.spinner("Generating voice response..."):
-                            audio_fp = generate_tts_audio(assistant_text)
+                            audio_fp = generate_tts_audio(final_answer)
                             if audio_fp:
                                 st.audio(audio_fp, format="audio/mp3", autoplay=True)
                         st.session_state.is_voice_input = False
