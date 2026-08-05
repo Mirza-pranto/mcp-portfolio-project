@@ -3,9 +3,11 @@ import os
 import asyncio
 import json
 import base64
+import tempfile
 from fastmcp import Client
 from fastmcp.client.transports import PythonStdioTransport
 from groq import Groq
+from audio_recorder_streamlit import audio_recorder
 
 # Propagate Supabase secrets into the process environment so the MCP server can access them.
 if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
@@ -118,6 +120,10 @@ with st.sidebar:
     if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
+        
+    st.divider()
+    st.markdown("### 🎤 Voice Input")
+    audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")        
 
 def render_message_content(content):
     if isinstance(content, str):
@@ -143,15 +149,40 @@ for message in st.session_state.messages:
 
 uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
 user_input = st.chat_input("Describe your issue...")
+voice_input = None
 
-if user_input is not None:
-    if not user_input.strip() and uploaded_image is None:
-        st.warning("Please provide a text description or upload a screenshot.")
+# Process Voice Input via Groq Whisper
+if audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
+    st.session_state.last_audio = audio_bytes
+    with st.spinner("Transcribing audio..."):
+        # Save audio bytes to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            tmp_file.write(audio_bytes)
+            tmp_path = tmp_file.name
+        
+        # Send to Groq Whisper for transcription
+        with open(tmp_path, "rb") as f:
+            transcription = client.audio.transcriptions.create(
+                file=("audio.wav", f.read()),
+                model="whisper-large-v3-turbo",
+            )
+        voice_input = transcription.text
+        os.remove(tmp_path)  # Clean up temp file
+        
+        # Show what was transcribed
+        st.toast(f"Transcribed: {voice_input}")
+
+# Determine the final input (prioritize voice if just recorded, otherwise text)
+active_input = voice_input or user_input
+
+if active_input is not None:
+    if not active_input.strip() and uploaded_image is None:
+        st.warning("Please provide a text description, record audio, or upload a screenshot.")
         st.stop()
 
     content = []
-    if user_input:
-        content.append({"type": "text", "text": user_input})
+    if active_input:
+        content.append({"type": "text", "text": active_input})
 
     if uploaded_image is not None:
         base64_image = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
@@ -163,8 +194,8 @@ if user_input is not None:
     st.session_state.messages.append({"role": "user", "content": content})
 
     with st.chat_message("user"):
-        if user_input:
-            st.markdown(user_input)
+        if active_input:
+            st.markdown(active_input)
         if uploaded_image is not None:
             st.image(uploaded_image)
 
