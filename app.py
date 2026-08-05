@@ -11,6 +11,7 @@ from fastmcp.client.transports import PythonStdioTransport
 from groq import Groq
 from audio_recorder_streamlit import audio_recorder
 from gtts import gTTS
+from supabase import create_client
 
 # Propagate Supabase secrets into the process environment so the MCP server can access them.
 if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
@@ -19,6 +20,11 @@ if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
     st.info("✅ Supabase credentials loaded from st.secrets into process environment.")
 else:
     st.warning("⚠️ Supabase keys missing from st.secrets! Check .streamlit/secrets.toml")
+
+# Initialize Supabase client for the frontend dashboard
+supabase_client = None
+if "SUPABASE_URL" in os.environ and "SUPABASE_KEY" in os.environ:
+    supabase_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
 # Diagnostic environment reporting
 env_status = {
@@ -150,6 +156,9 @@ if "messages" not in st.session_state:
 if "is_voice_input" not in st.session_state:
     st.session_state.is_voice_input = False
 
+if "is_agent" not in st.session_state:
+    st.session_state.is_agent = False
+
 with st.sidebar:
     st.markdown("### Controls")
     if st.button("Clear Chat"):
@@ -160,6 +169,54 @@ with st.sidebar:
     st.divider()
     st.markdown("### 🎤 Voice Input")
     audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")        
+    
+    st.divider()
+    st.markdown("### 🔒 Agent Portal")
+    
+    # Check if the user is logged in as an agent
+    if not st.session_state.is_agent:
+        st.caption("Staff only. Enter PIN to view queue.")
+        agent_pin = st.text_input("PIN", type="password", key="pin_input")
+        
+        # Fallback to '0000' if AGENT_PIN is missing from secrets
+        correct_pin = st.secrets.get("AGENT_PIN", "0000") 
+        
+        if st.button("Login"):
+            if agent_pin == correct_pin:
+                st.session_state.is_agent = True
+                st.success("Unlocked!")
+                st.rerun()
+            else:
+                st.error("Invalid PIN.")
+                
+    # If logged in, show the Live Ticket Queue
+    else:
+        if st.button("Log Out"):
+            st.session_state.is_agent = False
+            st.rerun()
+            
+        st.markdown("### 📋 Live Ticket Queue")
+        if st.button("Refresh Queue"):
+            st.rerun()
+            
+        if supabase_client:
+            try:
+                # Fetch the latest 10 open tickets
+                res = (supabase_client.table("tickets")
+                       .select("id, status, description")
+                       .order("id", desc=True)
+                       .limit(10)
+                       .execute())
+                
+                if res.data:
+                    # Display as a clean, interactive dataframe
+                    st.dataframe(res.data, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No active tickets found.")
+            except Exception as e:
+                st.caption(f"Unable to load queue: {e}")
+        else:
+            st.error("Database connection missing.")
 
 def render_message_content(content):
     if isinstance(content, str):
