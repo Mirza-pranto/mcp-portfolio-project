@@ -5,6 +5,11 @@ __pycache__/
 .env
 tickets.db
 
+# Local tooling / editor
+.DS_Store
+replace-secrets.txt
+.replace-secrets.txt
+
 
 
 
