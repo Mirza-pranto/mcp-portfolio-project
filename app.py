@@ -4,10 +4,13 @@ import asyncio
 import json
 import base64
 import tempfile
+import io
+import re
 from fastmcp import Client
 from fastmcp.client.transports import PythonStdioTransport
 from groq import Groq
 from audio_recorder_streamlit import audio_recorder
+from gtts import gTTS
 
 # Propagate Supabase secrets into the process environment so the MCP server can access them.
 if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
@@ -40,7 +43,36 @@ st.set_page_config(page_title="Omni-Support AI", layout="centered", page_icon="�
 st.title("⚡ IT Support Agent (Groq Edition)")
 st.caption("Powered by Llama 3.2 Vision & Model Context Protocol (MCP)")
 
-# 2. Async MCP Execution with explicit subprocess environment inheritance
+# 2. TTS Helper Functions
+def clean_text_for_speech(text: str, max_chars: int = 350) -> str:
+    """Strips markdown formatting/code and limits length to prevent Google TTS rate limits."""
+    text = re.sub(r'```[\s\S]*?```', ' Code snippet omitted. ', text)
+    text = re.sub(r'`[^`]*`', '', text)
+    text = re.sub(r'http[s]?://\S+', '', text)
+    text = re.sub(r'[\*#_~]', '', text)
+    text = re.sub(r'\n+', ' ', text).strip()
+    
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit(' ', 1)[0] + "... Please see screen for full details."
+    return text
+
+def generate_tts_audio(text: str) -> io.BytesIO | None:
+    """Safely converts text to an in-memory MP3 stream using gTTS with error fallback."""
+    try:
+        cleaned_text = clean_text_for_speech(text)
+        if not cleaned_text:
+            cleaned_text = "Here is the summary of your request."
+        
+        tts = gTTS(text=cleaned_text, lang="en", tld="com")
+        audio_fp = io.BytesIO()
+        tts.write_to_fp(audio_fp)
+        audio_fp.seek(0)
+        return audio_fp
+    except Exception as e:
+        st.warning(f"⚠️ Voice output unavailable: {str(e)}")
+        return None
+
+# 3. Async MCP Execution with explicit subprocess environment inheritance
 async def execute_mcp_tool(tool_name: str, tool_args: dict):
     mcp_env = os.environ.copy()
     transport = PythonStdioTransport("server.py", env=mcp_env)
@@ -49,7 +81,7 @@ async def execute_mcp_tool(tool_name: str, tool_args: dict):
         result = await mcp_client.call_tool(tool_name, tool_args)
         return result.data
 
-# 3. Define Tools using the standard OpenAI/Groq JSON Schema
+# 4. Define Tools using the standard OpenAI/Groq JSON Schema
 support_tools = [
     {
         "type": "function",
@@ -111,14 +143,18 @@ support_tools = [
     }
 ]
 
-# 4. Streamlit UI Elements
+# 5. Streamlit UI Elements & State Initialization
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if "is_voice_input" not in st.session_state:
+    st.session_state.is_voice_input = False
 
 with st.sidebar:
     st.markdown("### Controls")
     if st.button("Clear Chat"):
         st.session_state.messages = []
+        st.session_state.is_voice_input = False
         st.rerun()
         
     st.divider()
@@ -155,25 +191,28 @@ voice_input = None
 if audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
     st.session_state.last_audio = audio_bytes
     with st.spinner("Transcribing audio..."):
-        # Save audio bytes to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
             tmp_file.write(audio_bytes)
             tmp_path = tmp_file.name
         
-        # Send to Groq Whisper for transcription
         with open(tmp_path, "rb") as f:
             transcription = client.audio.transcriptions.create(
                 file=("audio.wav", f.read()),
                 model="whisper-large-v3-turbo",
             )
         voice_input = transcription.text
-        os.remove(tmp_path)  # Clean up temp file
-        
-        # Show what was transcribed
+        os.remove(tmp_path)
         st.toast(f"Transcribed: {voice_input}")
 
-# Determine the final input (prioritize voice if just recorded, otherwise text)
-active_input = voice_input or user_input
+# Determine active input type and set tracking flag
+if voice_input:
+    active_input = voice_input
+    st.session_state.is_voice_input = True
+elif user_input:
+    active_input = user_input
+    st.session_state.is_voice_input = False
+else:
+    active_input = None
 
 if active_input is not None:
     if not active_input.strip() and uploaded_image is None:
@@ -199,7 +238,6 @@ if active_input is not None:
         if uploaded_image is not None:
             st.image(uploaded_image)
 
-    # Note: Updated to Groq's official vision model
     VISION_MODEL = "qwen/qwen3.6-27b"
 
     with st.spinner("Analyzing request and executing tools..."):
@@ -269,12 +307,24 @@ if active_input is not None:
 
                 with st.chat_message("assistant"):
                     st.markdown(final_content)
+                    if st.session_state.get("is_voice_input", False):
+                        with st.spinner("Generating voice response..."):
+                            audio_fp = generate_tts_audio(final_content)
+                            if audio_fp:
+                                st.audio(audio_fp, format="audio/mp3", autoplay=True)
+                        st.session_state.is_voice_input = False
             else:
                 assistant_text = response_message.content or ""
                 st.session_state.messages.append({"role": "assistant", "content": assistant_text})
 
                 with st.chat_message("assistant"):
                     st.markdown(assistant_text)
+                    if st.session_state.get("is_voice_input", False):
+                        with st.spinner("Generating voice response..."):
+                            audio_fp = generate_tts_audio(assistant_text)
+                            if audio_fp:
+                                st.audio(audio_fp, format="audio/mp3", autoplay=True)
+                        st.session_state.is_voice_input = False
 
         except Exception as e:
             st.error(f"❌ **API Error:** {str(e)}")
