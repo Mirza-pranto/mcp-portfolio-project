@@ -3,6 +3,7 @@ import os
 from fastmcp import FastMCP
 from mcp.server.fastmcp import Context
 from supabase import create_client
+from duckduckgo_search import DDGS
 
 # Initialize the MCP Server
 mcp = FastMCP("SupportTicketingSystem")
@@ -83,6 +84,32 @@ def get_recent_tickets(limit: int = 5, ctx: Context | None = None) -> str:
         if ctx:
             ctx.error(f"Database query failed: {str(e)}")
         return f"ERROR: Database insertion failed - {str(e)}"
+
+
+@mcp.tool()
+def web_search(query: str, max_results: int = 5, ctx: Context | None = None) -> str:
+    """Search the web using DuckDuckGo to find real-time information, technical documentation, or troubleshooting guides."""
+    if ctx:
+        ctx.info(f"Performing web search for query: {query}")
+    try:
+        # Use a specific region and a short timeout to keep searches responsive
+        ddgs = DDGS(timeout=10)
+        results = list(ddgs.text(query, max_results=max_results, region="wt-wt"))
+        if not results:
+            return "No search results found for that query."
+
+        output = []
+        for i, r in enumerate(results, 1):
+            title = r.get('title') or r.get('title_no_format') or ''
+            href = r.get('href') or r.get('url') or ''
+            snippet = r.get('body') or r.get('snippet') or ''
+            output.append(f"{i}. {title}\n   URL: {href}\n   Snippet: {snippet}\n")
+        return "\n".join(output)
+    except Exception as e:
+        if ctx:
+            ctx.error(f"Web search failed: {str(e)}")
+        return f"ERROR: Web search failed - {str(e)}"
+
 
 if __name__ == "__main__":
     # Runs the server over stdio, the standard way MCP clients communicate with local servers.

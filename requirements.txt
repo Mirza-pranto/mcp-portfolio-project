@@ -4,3 +4,4 @@ groq
 pillow
 pydantic
 supabase
+duckduckgo_search

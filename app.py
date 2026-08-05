@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import os
 import asyncio
@@ -93,6 +92,20 @@ support_tools = [
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web using DuckDuckGo to find real-time information, technical documentation, or troubleshooting guides.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query string"}
+                },
+                "required": ["query"]
+            }
+        }
     }
 ]
 
@@ -105,7 +118,6 @@ with st.sidebar:
     if st.button("Clear Chat"):
         st.session_state.messages = []
         st.rerun()
-
 
 def render_message_content(content):
     if isinstance(content, str):
@@ -122,7 +134,6 @@ def render_message_content(content):
                     st.image(image_bytes)
                 else:
                     st.image(image_url)
-
 
 for message in st.session_state.messages:
     if message.get("role") == "tool":
@@ -157,10 +168,13 @@ if user_input is not None:
         if uploaded_image is not None:
             st.image(uploaded_image)
 
+    # Note: Updated to Groq's official vision model
+    VISION_MODEL = "qwen/qwen3.6-27b"
+
     with st.spinner("Analyzing request and executing tools..."):
         try:
             response = client.chat.completions.create(
-                model="qwen/qwen3.6-27b",
+                model=VISION_MODEL,
                 messages=st.session_state.messages,
                 tools=support_tools,
                 tool_choice="auto",
@@ -213,7 +227,7 @@ if user_input is not None:
                         st.success(f"✅ **MCP Server Output:**\n\n{mcp_output}")
 
                 follow_up_response = client.chat.completions.create(
-                    model="qwen/qwen3.6-27b",
+                    model=VISION_MODEL,
                     messages=st.session_state.messages,
                     tools=support_tools,
                     tool_choice="auto",
