@@ -6,6 +6,7 @@ import tempfile
 import io
 import re
 from datetime import datetime, timedelta
+import uuid
 
 import streamlit as st
 from fastmcp import Client
@@ -188,11 +189,15 @@ if "is_voice_input" not in st.session_state:
     st.session_state.is_voice_input = False
 if "kb_draft" not in st.session_state:
     st.session_state.kb_draft = ""
-if "messages_loaded" not in st.session_state:
-    st.session_state.messages_loaded = False   # avoid reloading on every rerun
+if "current_chat_id" not in st.session_state:
+    st.session_state.current_chat_id = None
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
+if "sessions_loaded" not in st.session_state:
+    st.session_state.sessions_loaded = False
 
 # -------------------------------------------------------------------
-# 7. Authentication & chat history helpers
+# 7. Authentication & chat helpers
 # -------------------------------------------------------------------
 def sign_in(email: str, password: str):
     try:
@@ -227,26 +232,71 @@ def sign_out():
     st.session_state.user_session = None
     st.session_state.user_role = None
     st.session_state.messages = []
-    st.session_state.messages_loaded = False
+    st.session_state.current_chat_id = None
+    st.session_state.chat_sessions = []
+    st.session_state.sessions_loaded = False
     st.rerun()
 
-def load_chat_history(email: str):
-    """Load all user and assistant messages from Supabase, ordered chronologically."""
+# --- Chat session helpers ---
+def create_chat_session(email: str, title: str = None) -> str:
+    """Create a new chat session and return its UUID."""
+    if title is None:
+        title = "New Chat"
+    try:
+        res = supabase_client.table("chat_sessions").insert({
+            "user_email": email,
+            "title": title
+        }).execute()
+        return res.data[0]["id"]
+    except Exception as e:
+        st.error(f"Failed to create chat session: {e}")
+        return None
+
+def get_user_sessions(email: str):
+    """Return list of sessions (id, title, created_at) for the user, newest first."""
+    try:
+        res = supabase_client.table("chat_sessions") \
+            .select("id, title, created_at") \
+            .eq("user_email", email) \
+            .order("created_at", desc=True) \
+            .execute()
+        return res.data if res.data else []
+    except Exception as e:
+        st.error(f"Failed to load sessions: {e}")
+        return []
+
+def load_messages_for_session(chat_id: str):
+    """Load all user/assistant messages for a session, ordered by created_at."""
     try:
         res = supabase_client.table("chat_messages") \
             .select("role, content") \
-            .eq("user_email", email) \
+            .eq("chat_id", chat_id) \
             .order("created_at", desc=False) \
             .execute()
         return res.data if res.data else []
     except Exception as e:
-        st.error(f"Failed to load chat history: {e}")
+        st.error(f"Failed to load messages: {e}")
         return []
 
-def save_message(email: str, role: str, content: str):
-    """Insert a single message into chat_messages."""
+def delete_chat_session(chat_id: str):
+    """Delete a session (cascade deletes messages)."""
+    try:
+        supabase_client.table("chat_sessions").delete().eq("id", chat_id).execute()
+    except Exception as e:
+        st.error(f"Failed to delete session: {e}")
+
+def update_chat_title(chat_id: str, title: str):
+    """Update the title of a session."""
+    try:
+        supabase_client.table("chat_sessions").update({"title": title}).eq("id", chat_id).execute()
+    except Exception as e:
+        st.error(f"Failed to update title: {e}")
+
+def save_message(chat_id: str, email: str, role: str, content: str):
+    """Save a single message with the given chat_id."""
     try:
         supabase_client.table("chat_messages").insert({
+            "chat_id": chat_id,
             "user_email": email,
             "role": role,
             "content": content
@@ -254,15 +304,8 @@ def save_message(email: str, role: str, content: str):
     except Exception as e:
         st.error(f"Failed to save message: {e}")
 
-def delete_chat_history(email: str):
-    """Delete all messages for a user."""
-    try:
-        supabase_client.table("chat_messages").delete().eq("user_email", email).execute()
-    except Exception as e:
-        st.error(f"Failed to delete chat history: {e}")
-
 # -------------------------------------------------------------------
-# 8. Login / Signup screen (shown when not authenticated)
+# 8. Login / Signup screen
 # -------------------------------------------------------------------
 if not st.session_state.user_session:
     st.markdown("## 👋 Welcome to Omni-Support")
@@ -282,28 +325,40 @@ if not st.session_state.user_session:
                 if res:
                     st.session_state.user_session = res
                     st.session_state.user_role = get_user_profile(res.user.id)
-                    st.session_state.messages_loaded = False   # force load on next render
                     st.rerun()
-            else:  # Sign Up
+            else:
                 res = sign_up(email, password)
                 if res:
                     st.session_state.user_session = res
                     st.session_state.user_role = get_user_profile(res.user.id)
-                    st.session_state.messages_loaded = False
                     st.success("Account created! You are now logged in.")
                     st.rerun()
     st.stop()
 
 # -------------------------------------------------------------------
-# 9. Once authenticated: load chat history (if not loaded)
+# 9. After login: load/initialize chat sessions
 # -------------------------------------------------------------------
 user_email = st.session_state.user_session.user.email
 is_agent = (st.session_state.user_role == "agent")
 
-# Load history only for non‑agent users
-if not is_agent and not st.session_state.messages_loaded:
-    history = load_chat_history(user_email)
-    # Reconstruct messages with system prompt first, then history
+if not is_agent and not st.session_state.sessions_loaded:
+    # Load all sessions
+    sessions = get_user_sessions(user_email)
+    st.session_state.chat_sessions = sessions
+
+    if sessions:
+        # Load the most recent session (first in list)
+        most_recent = sessions[0]
+        st.session_state.current_chat_id = most_recent["id"]
+        # Load messages for that session
+        history = load_messages_for_session(most_recent["id"])
+    else:
+        # Create a new session
+        new_id = create_chat_session(user_email)
+        st.session_state.current_chat_id = new_id
+        history = []
+
+    # Build system prompt
     system_prompt = (
         f"You are a helpful IT support agent. You are talking to user: {user_email}. "
         "Always use this email when creating tickets or looking up their history.\n"
@@ -312,13 +367,13 @@ if not is_agent and not st.session_state.messages_loaded:
         "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
     )
     st.session_state.messages = [{"role": "system", "content": system_prompt}]
-    # Append loaded messages
     for msg in history:
         st.session_state.messages.append({"role": msg["role"], "content": msg["content"]})
-    st.session_state.messages_loaded = True
+
+    st.session_state.sessions_loaded = True
 
 # -------------------------------------------------------------------
-# 10. Sidebar
+# 10. Sidebar with chat management
 # -------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"**👤 {user_email}**")
@@ -333,27 +388,91 @@ with st.sidebar:
     st.divider()
 
     if not is_agent:
-        # User mode: clear chat history and voice recorder
-        if st.button("🗑️ Clear Chat History"):
-            delete_chat_history(user_email)
-            st.session_state.messages = []  # will be reloaded on rerun
-            st.session_state.messages_loaded = False
-            st.rerun()
+        # --- Chat Management ---
+        st.markdown("### 💬 Chats")
 
-        if st.button("Clear Chat (local only)"):
-            # Clear session messages (but keep system prompt) – does not delete from DB
-            system_prompt = st.session_state.messages[0]["content"] if st.session_state.messages else ""
-            st.session_state.messages = [{"role": "system", "content": system_prompt}]
-            st.rerun()
+        # New Chat button
+        if st.button("➕ New Chat", use_container_width=True):
+            new_id = create_chat_session(user_email)
+            if new_id:
+                st.session_state.current_chat_id = new_id
+                # Reset messages (only system prompt)
+                system_prompt = st.session_state.messages[0]["content"]
+                st.session_state.messages = [{"role": "system", "content": system_prompt}]
+                # Refresh sessions list
+                st.session_state.chat_sessions = get_user_sessions(user_email)
+                st.rerun()
+
+        # List of existing sessions
+        sessions = st.session_state.chat_sessions
+        if sessions:
+            # Build display names with date and title
+            session_options = {}
+            for s in sessions:
+                display = f"{s['title']} ({s['created_at'][:10]})"
+                session_options[display] = s["id"]
+
+            # Find index of current chat
+            current_id = st.session_state.current_chat_id
+            current_display = None
+            for display, sid in session_options.items():
+                if sid == current_id:
+                    current_display = display
+                    break
+
+            selected_display = st.selectbox(
+                "Select a chat",
+                options=list(session_options.keys()),
+                index=list(session_options.values()).index(current_id) if current_id in session_options.values() else 0,
+                key="chat_selector"
+            )
+
+            if selected_display:
+                selected_id = session_options[selected_display]
+                if selected_id != current_id:
+                    # Switch to selected chat
+                    st.session_state.current_chat_id = selected_id
+                    history = load_messages_for_session(selected_id)
+                    system_prompt = st.session_state.messages[0]["content"]
+                    st.session_state.messages = [{"role": "system", "content": system_prompt}]
+                    for msg in history:
+                        st.session_state.messages.append({"role": msg["role"], "content": msg["content"]})
+                    st.rerun()
+
+            # Delete button for active chat
+            if st.button("🗑️ Delete Chat", use_container_width=True):
+                delete_chat_session(current_id)
+                # Remove from sessions list
+                st.session_state.chat_sessions = [s for s in sessions if s["id"] != current_id]
+                if st.session_state.chat_sessions:
+                    # Switch to the next most recent
+                    new_session = st.session_state.chat_sessions[0]
+                    st.session_state.current_chat_id = new_session["id"]
+                    history = load_messages_for_session(new_session["id"])
+                    system_prompt = st.session_state.messages[0]["content"]
+                    st.session_state.messages = [{"role": "system", "content": system_prompt}]
+                    for msg in history:
+                        st.session_state.messages.append({"role": msg["role"], "content": msg["content"]})
+                else:
+                    # No sessions left, create a fresh one
+                    new_id = create_chat_session(user_email)
+                    st.session_state.current_chat_id = new_id
+                    system_prompt = st.session_state.messages[0]["content"]
+                    st.session_state.messages = [{"role": "system", "content": system_prompt}]
+                    st.session_state.chat_sessions = get_user_sessions(user_email)
+                st.rerun()
+        else:
+            st.info("No chats yet. Start a new one!")
 
         st.divider()
         st.markdown("### 🎤 Voice Input")
         audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")
+
     else:
         st.markdown("✅ **Agent Dashboard active**")
 
 # -------------------------------------------------------------------
-# 11. Render functions
+# 11. Agent Dashboard (unchanged)
 # -------------------------------------------------------------------
 def render_agent_dashboard():
     """Full‑screen agent dashboard with three tabs."""
@@ -361,9 +480,7 @@ def render_agent_dashboard():
 
     tab1, tab2, tab3 = st.tabs(["🎫 Ticket Queue", "📚 Knowledge Base", "⚙️ System Status"])
 
-    # ---------- TAB 1: Ticket Queue + Manage ----------
     with tab1:
-        # Metrics row
         col1, col2, col3 = st.columns(3)
         total_tickets = recent_tickets = open_tickets = 0
         if supabase_client:
@@ -385,7 +502,6 @@ def render_agent_dashboard():
         if st.button("🔄 Refresh Queue", key="refresh_queue"):
             st.rerun()
 
-        # Full ticket table
         if supabase_client:
             try:
                 res = supabase_client.table("tickets").select("*").order("id", desc=True).execute()
@@ -398,7 +514,6 @@ def render_agent_dashboard():
         else:
             st.error("Database connection missing.")
 
-        # ---------- Manage Ticket section ----------
         st.divider()
         st.subheader("📝 Manage Ticket")
 
@@ -446,7 +561,6 @@ def render_agent_dashboard():
                                 except Exception as e:
                                     st.error(f"Update failed: {e}")
 
-                            # Proactive KB Generation (if resolved)
                             if ticket.get("status") == "Resolved":
                                 st.divider()
                                 st.subheader("💡 Proactive KB Generation")
@@ -520,7 +634,6 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
         else:
             st.error("Database connection missing.")
 
-    # ---------- TAB 2: Knowledge Base Management ----------
     with tab2:
         col1, col2 = st.columns(2)
 
@@ -589,7 +702,6 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
             else:
                 st.error("Database connection missing.")
 
-    # ---------- TAB 3: System Status ----------
     with tab3:
         st.subheader("🖥️ System Status")
         st.markdown("**Supabase Connection:**")
@@ -611,7 +723,6 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
 # 12. Chat interface (for non‑agent users)
 # -------------------------------------------------------------------
 def render_user_chat():
-    # System prompt is already in st.session_state.messages[0]
     # Display chat history (skip system and tool messages)
     for message in st.session_state.messages:
         if message.get("role") in ["tool", "system"]:
@@ -632,12 +743,10 @@ def render_user_chat():
                         else:
                             st.image(image_url)
 
-    # Input area
     uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
     user_input = st.chat_input("Describe your issue...")
     voice_input = None
 
-    # Voice input from sidebar
     if 'audio_bytes' in locals() and audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
         st.session_state.last_audio = audio_bytes
         with st.spinner("Transcribing audio..."):
@@ -653,7 +762,6 @@ def render_user_chat():
             os.remove(tmp_path)
             st.toast(f"Transcribed: {voice_input}")
 
-    # Determine active input
     if voice_input:
         active_input = voice_input
         st.session_state.is_voice_input = True
@@ -686,9 +794,20 @@ def render_user_chat():
         user_message = {"role": "user", "content": content}
         st.session_state.messages.append(user_message)
 
-        # Save user message to Supabase (extract text only for storage)
+        # Save user message to Supabase with chat_id
         user_text = active_text if active_text else "Uploaded an image and asked for assistance."
-        save_message(user_email, "user", user_text)
+        save_message(st.session_state.current_chat_id, user_email, "user", user_text)
+
+        # Auto-title: if this is the first user message and the session title is still "New Chat"
+        # We need to fetch current title to see if it's the default.
+        # For simplicity, we check if there are exactly 2 messages (system + this user message)
+        # and we update title.
+        if len(st.session_state.messages) == 2:
+            # First user message after system prompt
+            title = user_text[:30] + ("..." if len(user_text) > 30 else "")
+            update_chat_title(st.session_state.current_chat_id, title)
+            # Refresh sessions list to reflect new title
+            st.session_state.chat_sessions = get_user_sessions(user_email)
 
         with st.chat_message("user"):
             if active_text:
@@ -774,8 +893,8 @@ def render_user_chat():
                     st.session_state.messages.append({"role": "assistant", "content": final_answer})
 
                 if final_answer is not None:
-                    # Save assistant response to Supabase
-                    save_message(user_email, "assistant", final_answer)
+                    # Save assistant response with chat_id
+                    save_message(st.session_state.current_chat_id, user_email, "assistant", final_answer)
 
                     with st.chat_message("assistant"):
                         st.markdown(final_answer)
@@ -790,7 +909,7 @@ def render_user_chat():
                 st.error(f"❌ **API Error:** {str(e)}")
 
 # -------------------------------------------------------------------
-# 13. Main routing: agent dashboard vs user chat
+# 13. Main routing
 # -------------------------------------------------------------------
 if is_agent:
     render_agent_dashboard()
