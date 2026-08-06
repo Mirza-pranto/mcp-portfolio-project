@@ -186,6 +186,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "is_voice_input" not in st.session_state:
     st.session_state.is_voice_input = False
+if "kb_draft" not in st.session_state:
+    st.session_state.kb_draft = ""
 
 # -------------------------------------------------------------------
 # 7. Authentication helper functions
@@ -212,7 +214,6 @@ def get_user_profile(user_id: str):
         if res.data:
             return res.data[0].get("role", "user")
         else:
-            # No profile yet – create one with default role 'user'
             supabase_client.table("user_profiles").insert({"id": user_id, "role": "user"}).execute()
             return "user"
     except Exception as e:
@@ -251,7 +252,6 @@ if not st.session_state.user_session:
             else:  # Sign Up
                 res = sign_up(email, password)
                 if res:
-                    # After sign-up, automatically create profile and log in
                     st.session_state.user_session = res
                     st.session_state.user_role = get_user_profile(res.user.id)
                     st.success("Account created! You are now logged in.")
@@ -277,7 +277,6 @@ with st.sidebar:
     st.divider()
 
     if not is_agent:
-        # User mode: show clear chat and voice recorder
         if st.button("Clear Chat"):
             st.session_state.messages = []
             st.rerun()
@@ -285,7 +284,6 @@ with st.sidebar:
         st.markdown("### 🎤 Voice Input")
         audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")
     else:
-        # Agent mode: no extra controls (dashboard takes over)
         st.markdown("✅ **Agent Dashboard active**")
 
 # -------------------------------------------------------------------
@@ -318,7 +316,6 @@ def render_agent_dashboard():
         col2.metric("🕒 New (24h)", recent_tickets)
         col3.metric("🟢 Open Tickets", open_tickets)
 
-        # Refresh button
         if st.button("🔄 Refresh Queue", key="refresh_queue"):
             st.rerun()
 
@@ -340,7 +337,6 @@ def render_agent_dashboard():
         st.subheader("📝 Manage Ticket")
 
         if supabase_client:
-            # Get list of ticket IDs for selection
             try:
                 id_res = supabase_client.table("tickets").select("id").order("id", desc=True).execute()
                 ticket_ids = [str(t["id"]) for t in id_res.data] if id_res.data else []
@@ -351,7 +347,6 @@ def render_agent_dashboard():
                 selected_id_str = st.selectbox("Select a ticket by ID:", ticket_ids, key="ticket_selector")
                 if selected_id_str:
                     ticket_id = int(selected_id_str)
-                    # Fetch ticket details
                     try:
                         detail_res = supabase_client.table("tickets").select("*").eq("id", ticket_id).execute()
                         if detail_res.data:
@@ -362,7 +357,6 @@ def render_agent_dashboard():
                             st.text(f"**Created At:** {ticket.get('created_at', 'N/A')}")
                             st.text(f"**Internal Notes:** {ticket.get('internal_notes', '')}")
 
-                            # Update controls
                             new_status = st.selectbox(
                                 "Update Status",
                                 ["Open", "In Progress", "Resolved", "Closed"],
@@ -385,6 +379,77 @@ def render_agent_dashboard():
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Update failed: {e}")
+
+                            # ---------- Proactive KB Generation ----------
+                            # Check if the ticket is resolved (current status or the new status chosen)
+                            # We'll show if the ticket is resolved according to the fetched ticket,
+                            # and also after update we rely on rerun.
+                            if ticket.get("status") == "Resolved":
+                                st.divider()
+                                st.subheader("💡 Proactive KB Generation")
+                                st.markdown("This ticket is marked as **Resolved**. Generate a knowledge base article from the resolution notes.")
+
+                                if st.button("📄 Generate KB Article from Resolution"):
+                                    with st.spinner("Generating KB draft using Groq..."):
+                                        prompt = f"""
+You are a technical writer creating a knowledge base article from a support ticket resolution.
+
+**Issue (Description):**
+{ticket.get('description', 'N/A')}
+
+**Resolution (Internal Notes):**
+{ticket.get('internal_notes', 'N/A')}
+
+Please write a clear, concise troubleshooting guide that includes:
+- A brief summary of the issue
+- Step-by-step resolution steps
+- Any relevant warnings or prerequisites
+
+Format the article in plain text with clear headings (e.g., "Issue", "Solution", "Notes").
+"""
+                                        try:
+                                            response = client.chat.completions.create(
+                                                model="llama-3.3-70b-versatile",  # or your preferred model
+                                                messages=[{"role": "user", "content": prompt}],
+                                                temperature=0.7,
+                                                max_tokens=800
+                                            )
+                                            draft = response.choices[0].message.content.strip()
+                                            st.session_state.kb_draft = draft
+                                            st.success("Draft generated! Review and edit below.")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Failed to generate draft: {e}")
+
+                            # If a draft exists, show the editor and save button
+                            if st.session_state.kb_draft:
+                                st.divider()
+                                st.subheader("✏️ Review & Edit Draft KB Article")
+                                edited_draft = st.text_area(
+                                    "Edit the article before saving:",
+                                    value=st.session_state.kb_draft,
+                                    height=250,
+                                    key="kb_edit_area"
+                                )
+
+                                if st.button("💾 Save to Knowledge Base"):
+                                    if edited_draft.strip():
+                                        with st.spinner("Saving to KB..."):
+                                            embedder = load_embedder()
+                                            embedding = embedder.encode(edited_draft).tolist()
+                                            try:
+                                                supabase_client.table("kb_articles").insert({
+                                                    "content": edited_draft,
+                                                    "embedding": embedding
+                                                }).execute()
+                                                st.toast("✅ Article successfully added to Knowledge Base!")
+                                                st.session_state.kb_draft = ""  # Clear draft
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Failed to save: {e}")
+                                    else:
+                                        st.warning("Article cannot be empty.")
+
                         else:
                             st.info("Ticket not found.")
                     except Exception as e:
@@ -494,14 +559,11 @@ def render_user_chat():
         "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
     )
 
-    # Initialise messages if empty or if system prompt changed (e.g., after login)
     if not st.session_state.messages:
         st.session_state.messages = [{"role": "system", "content": system_prompt}]
     elif st.session_state.messages[0]["content"] != system_prompt:
-        # Update system prompt if user changed (should not happen within a session)
         st.session_state.messages[0] = {"role": "system", "content": system_prompt}
 
-    # Display chat history (skip system and tool messages)
     for message in st.session_state.messages:
         if message.get("role") in ["tool", "system"]:
             continue
@@ -521,12 +583,10 @@ def render_user_chat():
                         else:
                             st.image(image_url)
 
-    # Input area
     uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
     user_input = st.chat_input("Describe your issue...")
     voice_input = None
 
-    # Voice input from sidebar
     if 'audio_bytes' in locals() and audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
         st.session_state.last_audio = audio_bytes
         with st.spinner("Transcribing audio..."):
@@ -542,7 +602,6 @@ def render_user_chat():
             os.remove(tmp_path)
             st.toast(f"Transcribed: {voice_input}")
 
-    # Determine active input
     if voice_input:
         active_input = voice_input
         st.session_state.is_voice_input = True
@@ -581,7 +640,7 @@ def render_user_chat():
             if uploaded_image is not None:
                 st.image(uploaded_image)
 
-        VISION_MODEL = "qwen/qwen3.6-27b"  # Ensure this model is available
+        VISION_MODEL = "qwen/qwen3.6-27b"
 
         with st.spinner("Analyzing request and executing tools..."):
             try:
