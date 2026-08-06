@@ -1,7 +1,9 @@
-fastmcp
 streamlit
+fastmcp
 groq
-pillow
-pydantic
+audio-recorder-streamlit
+gtts
 supabase
-duckduckgo_search
+pypdf
+sentence-transformers
+duckduckgo-search
