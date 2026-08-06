@@ -188,9 +188,11 @@ if "is_voice_input" not in st.session_state:
     st.session_state.is_voice_input = False
 if "kb_draft" not in st.session_state:
     st.session_state.kb_draft = ""
+if "messages_loaded" not in st.session_state:
+    st.session_state.messages_loaded = False   # avoid reloading on every rerun
 
 # -------------------------------------------------------------------
-# 7. Authentication helper functions
+# 7. Authentication & chat history helpers
 # -------------------------------------------------------------------
 def sign_in(email: str, password: str):
     try:
@@ -225,7 +227,39 @@ def sign_out():
     st.session_state.user_session = None
     st.session_state.user_role = None
     st.session_state.messages = []
+    st.session_state.messages_loaded = False
     st.rerun()
+
+def load_chat_history(email: str):
+    """Load all user and assistant messages from Supabase, ordered chronologically."""
+    try:
+        res = supabase_client.table("chat_messages") \
+            .select("role, content") \
+            .eq("user_email", email) \
+            .order("created_at", desc=False) \
+            .execute()
+        return res.data if res.data else []
+    except Exception as e:
+        st.error(f"Failed to load chat history: {e}")
+        return []
+
+def save_message(email: str, role: str, content: str):
+    """Insert a single message into chat_messages."""
+    try:
+        supabase_client.table("chat_messages").insert({
+            "user_email": email,
+            "role": role,
+            "content": content
+        }).execute()
+    except Exception as e:
+        st.error(f"Failed to save message: {e}")
+
+def delete_chat_history(email: str):
+    """Delete all messages for a user."""
+    try:
+        supabase_client.table("chat_messages").delete().eq("user_email", email).execute()
+    except Exception as e:
+        st.error(f"Failed to delete chat history: {e}")
 
 # -------------------------------------------------------------------
 # 8. Login / Signup screen (shown when not authenticated)
@@ -248,22 +282,44 @@ if not st.session_state.user_session:
                 if res:
                     st.session_state.user_session = res
                     st.session_state.user_role = get_user_profile(res.user.id)
+                    st.session_state.messages_loaded = False   # force load on next render
                     st.rerun()
             else:  # Sign Up
                 res = sign_up(email, password)
                 if res:
                     st.session_state.user_session = res
                     st.session_state.user_role = get_user_profile(res.user.id)
+                    st.session_state.messages_loaded = False
                     st.success("Account created! You are now logged in.")
                     st.rerun()
     st.stop()
 
 # -------------------------------------------------------------------
-# 9. Once authenticated: show sidebar with user info & sign out
+# 9. Once authenticated: load chat history (if not loaded)
 # -------------------------------------------------------------------
 user_email = st.session_state.user_session.user.email
 is_agent = (st.session_state.user_role == "agent")
 
+# Load history only for non‑agent users
+if not is_agent and not st.session_state.messages_loaded:
+    history = load_chat_history(user_email)
+    # Reconstruct messages with system prompt first, then history
+    system_prompt = (
+        f"You are a helpful IT support agent. You are talking to user: {user_email}. "
+        "Always use this email when creating tickets or looking up their history.\n"
+        "Tool usage rules:\n"
+        "1. Always search the internal knowledge base first using `search_knowledge_base`.\n"
+        "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
+    )
+    st.session_state.messages = [{"role": "system", "content": system_prompt}]
+    # Append loaded messages
+    for msg in history:
+        st.session_state.messages.append({"role": msg["role"], "content": msg["content"]})
+    st.session_state.messages_loaded = True
+
+# -------------------------------------------------------------------
+# 10. Sidebar
+# -------------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"**👤 {user_email}**")
     if is_agent:
@@ -277,9 +333,19 @@ with st.sidebar:
     st.divider()
 
     if not is_agent:
-        if st.button("Clear Chat"):
-            st.session_state.messages = []
+        # User mode: clear chat history and voice recorder
+        if st.button("🗑️ Clear Chat History"):
+            delete_chat_history(user_email)
+            st.session_state.messages = []  # will be reloaded on rerun
+            st.session_state.messages_loaded = False
             st.rerun()
+
+        if st.button("Clear Chat (local only)"):
+            # Clear session messages (but keep system prompt) – does not delete from DB
+            system_prompt = st.session_state.messages[0]["content"] if st.session_state.messages else ""
+            st.session_state.messages = [{"role": "system", "content": system_prompt}]
+            st.rerun()
+
         st.divider()
         st.markdown("### 🎤 Voice Input")
         audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")
@@ -287,7 +353,7 @@ with st.sidebar:
         st.markdown("✅ **Agent Dashboard active**")
 
 # -------------------------------------------------------------------
-# 10. Define render functions for agent dashboard and chat
+# 11. Render functions
 # -------------------------------------------------------------------
 def render_agent_dashboard():
     """Full‑screen agent dashboard with three tabs."""
@@ -380,10 +446,7 @@ def render_agent_dashboard():
                                 except Exception as e:
                                     st.error(f"Update failed: {e}")
 
-                            # ---------- Proactive KB Generation ----------
-                            # Check if the ticket is resolved (current status or the new status chosen)
-                            # We'll show if the ticket is resolved according to the fetched ticket,
-                            # and also after update we rely on rerun.
+                            # Proactive KB Generation (if resolved)
                             if ticket.get("status") == "Resolved":
                                 st.divider()
                                 st.subheader("💡 Proactive KB Generation")
@@ -409,7 +472,7 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
 """
                                         try:
                                             response = client.chat.completions.create(
-                                                model="llama-3.3-70b-versatile",  # or your preferred model
+                                                model="llama-3.3-70b-versatile",
                                                 messages=[{"role": "user", "content": prompt}],
                                                 temperature=0.7,
                                                 max_tokens=800
@@ -421,7 +484,6 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
                                         except Exception as e:
                                             st.error(f"Failed to generate draft: {e}")
 
-                            # If a draft exists, show the editor and save button
                             if st.session_state.kb_draft:
                                 st.divider()
                                 st.subheader("✏️ Review & Edit Draft KB Article")
@@ -443,13 +505,12 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
                                                     "embedding": embedding
                                                 }).execute()
                                                 st.toast("✅ Article successfully added to Knowledge Base!")
-                                                st.session_state.kb_draft = ""  # Clear draft
+                                                st.session_state.kb_draft = ""
                                                 st.rerun()
                                             except Exception as e:
                                                 st.error(f"Failed to save: {e}")
                                     else:
                                         st.warning("Article cannot be empty.")
-
                         else:
                             st.info("Ticket not found.")
                     except Exception as e:
@@ -547,23 +608,11 @@ Format the article in plain text with clear headings (e.g., "Issue", "Solution",
         st.json(env_status)
 
 # -------------------------------------------------------------------
-# 11. Chat interface (for non‑agent users)
+# 12. Chat interface (for non‑agent users)
 # -------------------------------------------------------------------
 def render_user_chat():
-    # System prompt uses the authenticated user's email
-    system_prompt = (
-        f"You are a helpful IT support agent. You are talking to user: {user_email}. "
-        "Always use this email when creating tickets or looking up their history.\n"
-        "Tool usage rules:\n"
-        "1. Always search the internal knowledge base first using `search_knowledge_base`.\n"
-        "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
-    )
-
-    if not st.session_state.messages:
-        st.session_state.messages = [{"role": "system", "content": system_prompt}]
-    elif st.session_state.messages[0]["content"] != system_prompt:
-        st.session_state.messages[0] = {"role": "system", "content": system_prompt}
-
+    # System prompt is already in st.session_state.messages[0]
+    # Display chat history (skip system and tool messages)
     for message in st.session_state.messages:
         if message.get("role") in ["tool", "system"]:
             continue
@@ -583,10 +632,12 @@ def render_user_chat():
                         else:
                             st.image(image_url)
 
+    # Input area
     uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
     user_input = st.chat_input("Describe your issue...")
     voice_input = None
 
+    # Voice input from sidebar
     if 'audio_bytes' in locals() and audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
         st.session_state.last_audio = audio_bytes
         with st.spinner("Transcribing audio..."):
@@ -602,6 +653,7 @@ def render_user_chat():
             os.remove(tmp_path)
             st.toast(f"Transcribed: {voice_input}")
 
+    # Determine active input
     if voice_input:
         active_input = voice_input
         st.session_state.is_voice_input = True
@@ -630,7 +682,13 @@ def render_user_chat():
                 "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
             })
 
-        st.session_state.messages.append({"role": "user", "content": content})
+        # Append user message to session
+        user_message = {"role": "user", "content": content}
+        st.session_state.messages.append(user_message)
+
+        # Save user message to Supabase (extract text only for storage)
+        user_text = active_text if active_text else "Uploaded an image and asked for assistance."
+        save_message(user_email, "user", user_text)
 
         with st.chat_message("user"):
             if active_text:
@@ -716,6 +774,9 @@ def render_user_chat():
                     st.session_state.messages.append({"role": "assistant", "content": final_answer})
 
                 if final_answer is not None:
+                    # Save assistant response to Supabase
+                    save_message(user_email, "assistant", final_answer)
+
                     with st.chat_message("assistant"):
                         st.markdown(final_answer)
                         if st.session_state.get("is_voice_input", False):
@@ -729,7 +790,7 @@ def render_user_chat():
                 st.error(f"❌ **API Error:** {str(e)}")
 
 # -------------------------------------------------------------------
-# 12. Main routing: agent dashboard vs user chat
+# 13. Main routing: agent dashboard vs user chat
 # -------------------------------------------------------------------
 if is_agent:
     render_agent_dashboard()
