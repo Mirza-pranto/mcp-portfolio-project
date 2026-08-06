@@ -227,346 +227,373 @@ if "is_voice_input" not in st.session_state:
 
 if "is_agent" not in st.session_state:
     st.session_state.is_agent = False
-    
+
+# ------------------------------------------------------------------------------
+# SIDEBAR – now only contains login/logout and (optionally) clear chat
+# ------------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### Controls")
-    if st.button("Clear Chat"):
-        # Reset the chat but keep the user logged in
-        st.session_state.messages = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT_TEMPLATE.format(user_email=st.session_state.user_email)
-            }
-        ]
-        st.session_state.is_voice_input = False
-        st.rerun()
-        
-    st.divider()
-    st.markdown("### 🎤 Voice Input")
-    audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")        
-    
-    st.divider()
-    st.markdown("### 🔒 Agent Portal")
-    
-    # Check if the user is logged in as an agent
+    # Show Clear Chat only when NOT in agent mode (i.e., user chat is visible)
     if not st.session_state.is_agent:
-        st.caption("Staff only. Enter PIN to view queue.")
-        agent_pin = st.text_input("PIN", type="password", key="pin_input")
-        
-        # Fallback to '0000' if AGENT_PIN is missing from secrets
-        correct_pin = st.secrets.get("AGENT_PIN", "0000") 
-        
-        if st.button("Login"):
-            if agent_pin == correct_pin:
-                st.session_state.is_agent = True
-                st.success("Unlocked!")
-                st.rerun()
-            else:
-                st.error("Invalid PIN.")
-                
-    # If logged in, show Ticket Queue and Knowledge Base tools
+        if st.button("Clear Chat"):
+            st.session_state.messages = [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT_TEMPLATE.format(user_email=st.session_state.user_email)
+                }
+            ]
+            st.session_state.is_voice_input = False
+            st.rerun()
+        st.divider()
+        st.markdown("### 🎤 Voice Input")
+        audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")
     else:
+        # Agent mode: show logout only
+        st.markdown("### 🔒 Agent Portal")
         if st.button("Log Out Agent"):
             st.session_state.is_agent = False
             st.rerun()
-            
-        st.markdown("### 📋 Live Ticket Queue")
-        if st.button("Refresh Queue"):
-            st.rerun()
-            
+        st.divider()
+        st.markdown("✅ Logged in as **Agent**")
+
+    # Always show the agent login box (if not already agent)
+    if not st.session_state.is_agent:
+        st.divider()
+        st.markdown("### 🔒 Agent Portal")
+        st.caption("Staff only. Enter PIN to view queue.")
+        agent_pin = st.text_input("PIN", type="password", key="pin_input", placeholder="Enter PIN")
+        correct_pin = st.secrets.get("AGENT_PIN", "0000")
+        if st.button("Login", key="agent_login_btn"):
+            if agent_pin == correct_pin:
+                st.session_state.is_agent = True
+                st.rerun()
+            else:
+                st.error("Invalid PIN.")
+
+# ------------------------------------------------------------------------------
+# MAIN AREA – decide what to render based on agent status
+# ------------------------------------------------------------------------------
+
+def render_admin_dashboard():
+    """Dedicated admin dashboard with tabs and full-screen layout."""
+    st.markdown("## 🛠️ Agent Dashboard")
+    
+    # Create three tabs
+    tab1, tab2, tab3 = st.tabs(["🎫 Ticket Queue", "📚 Knowledge Base", "⚙️ System Status"])
+
+    # ---------- TAB 1: Ticket Queue ----------
+    with tab1:
+        # Metrics row
+        col1, col2, col3 = st.columns(3)
+        total_tickets = 0
+        recent_tickets = 0
+        open_tickets = 0
+
         if supabase_client:
             try:
-                res = (supabase_client.table("tickets")
-                       .select("id, status, description, user_email")
-                       .order("id", desc=True)
-                       .limit(10)
-                       .execute())
+                # Get total count
+                total_res = supabase_client.table("tickets").select("*", count="exact").execute()
+                total_tickets = total_res.count if hasattr(total_res, 'count') else len(total_res.data)
+                
+                # Get recent (last 24h)
+                from datetime import datetime, timedelta
+                yesterday = (datetime.now() - timedelta(days=1)).isoformat()
+                recent_res = supabase_client.table("tickets").select("*", count="exact").gt("created_at", yesterday).execute()
+                recent_tickets = recent_res.count if hasattr(recent_res, 'count') else len(recent_res.data)
+
+                # Get open tickets (status != 'closed')
+                open_res = supabase_client.table("tickets").select("*", count="exact").neq("status", "closed").execute()
+                open_tickets = open_res.count if hasattr(open_res, 'count') else len(open_res.data)
+            except Exception as e:
+                st.error(f"Could not fetch metrics: {e}")
+
+        col1.metric("📊 Total Tickets", total_tickets)
+        col2.metric("🕒 New (24h)", recent_tickets)
+        col3.metric("🟢 Open Tickets", open_tickets)
+
+        # Refresh button and table
+        if st.button("🔄 Refresh Queue", key="refresh_queue"):
+            st.rerun()
+        
+        if supabase_client:
+            try:
+                res = supabase_client.table("tickets").select("*").order("id", desc=True).execute()
                 if res.data:
                     st.dataframe(res.data, use_container_width=True, hide_index=True)
                 else:
-                    st.caption("No active tickets found.")
+                    st.info("No tickets found.")
             except Exception as e:
-                st.caption(f"Unable to load queue: {e}")
+                st.error(f"Failed to load queue: {e}")
         else:
             st.error("Database connection missing.")
-            
-        st.divider()
 
-        # --- Manage & Delete Knowledge Base Articles ---
-        st.markdown("### 🗑️ Manage Knowledge Base")
+    # ---------- TAB 2: Knowledge Base Management ----------
+    with tab2:
+        col1, col2 = st.columns(2)
         
-        if supabase_client:
-            try:
-                # Fetch all KB articles to display in the dropdown
-                kb_res = (supabase_client.table("kb_articles")
-                          .select("id, title")
-                          .order("id", desc=True)
-                          .execute())
-                
-                if kb_res.data:
-                    # Create a dictionary to map the display name to the database ID
-                    kb_options = {f"[{item['id']}] {item['title']}": item['id'] for item in kb_res.data}
-                    
-                    selected_article = st.selectbox(
-                        "Select a document chunk to remove:", 
-                        options=list(kb_options.keys())
-                    )
-                    
-                    if st.button("Delete Selected"):
-                        article_id = kb_options[selected_article]
-                        # Delete the specific row from Supabase
-                        supabase_client.table("kb_articles").delete().eq("id", article_id).execute()
-                        st.success(f"✅ Deleted {selected_article}")
-                        st.rerun() # Refresh the UI immediately
-                else:
-                    st.caption("Knowledge base is currently empty.")
-            except Exception as e:
-                st.caption(f"Unable to load KB articles: {e}")    
-
-        st.divider()
-
-        # --- Knowledge Base Uploader ---
-        st.markdown("### 📚 Update Knowledge Base")
-        uploaded_kb_files = st.file_uploader("Upload IT Manuals", type=["pdf", "txt"], accept_multiple_files=True)
-        
-        if st.button("Ingest Files") and uploaded_kb_files:
-            with st.spinner("Extracting and embedding documents..."):
-                embedder = load_embedder()
-                
-                for file in uploaded_kb_files:
-                    text_content = ""
-                    
-                    # Extract text based on file type
-                    if file.name.endswith(".txt"):
-                        text_content = file.getvalue().decode("utf-8")
-                    elif file.name.endswith(".pdf"):
-                        reader = PdfReader(file)
-                        for page in reader.pages:
-                            text_content += page.extract_text() + "\n"
-                            
-                    # Clean up spacing
-                    text_content = text_content.strip()
-                    if not text_content:
-                        continue
-                        
-                    # Chunk the text into ~1000 character segments
-                    chunk_size = 1000
-                    chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
-                    
-                    for i, chunk in enumerate(chunks):
-                        if not chunk.strip(): 
-                            continue
-                            
-                        # Generate vector embedding for the chunk
-                        embedding = embedder.encode(chunk).tolist()
-                        
-                        # Insert into Supabase
-                        supabase_client.table("kb_articles").insert({
-                            "title": f"{file.name} (Part {i+1})",
-                            "content": chunk,
-                            "embedding": embedding
-                        }).execute()
-                        
-                st.success("✅ Files successfully processed and added to the Knowledge Base!")
-                st.rerun() # Refreshes sidebar so new items show up in the Delete dropdown right away
-
-
-def render_message_content(content):
-    if isinstance(content, str):
-        st.markdown(content)
-    elif isinstance(content, list):
-        for item in content:
-            if item.get("type") == "text":
-                st.markdown(item.get("text", ""))
-            elif item.get("type") == "image_url":
-                image_url = item.get("image_url", {}).get("url", "")
-                if image_url.startswith("data:image"):
-                    _, encoded = image_url.split(",", 1)
-                    image_bytes = base64.b64decode(encoded)
-                    st.image(image_bytes)
-                else:
-                    st.image(image_url)
-
-for message in st.session_state.messages:
-    # Skip rendering system messages and tool outputs in the main chat UI
-    if message.get("role") in ["tool", "system"]:
-        continue
-    with st.chat_message(message["role"]):
-        render_message_content(message.get("content"))
-
-uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
-user_input = st.chat_input("Describe your issue...")
-voice_input = None
-
-# Process Voice Input via Groq Whisper
-if audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
-    st.session_state.last_audio = audio_bytes
-    with st.spinner("Transcribing audio..."):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-            tmp_file.write(audio_bytes)
-            tmp_path = tmp_file.name
-        
-        with open(tmp_path, "rb") as f:
-            transcription = client.audio.transcriptions.create(
-                file=("audio.wav", f.read()),
-                model="whisper-large-v3-turbo",
+        # Column 1: Add Content
+        with col1:
+            st.subheader("📥 Add Content")
+            uploaded_kb_files = st.file_uploader(
+                "Upload IT Manuals (PDF/TXT)",
+                type=["pdf", "txt"],
+                accept_multiple_files=True,
+                key="kb_uploader"
             )
-        voice_input = transcription.text
-        os.remove(tmp_path)
-        st.toast(f"Transcribed: {voice_input}")
-
-# Determine active input type and set tracking flag
-if voice_input:
-    active_input = voice_input
-    st.session_state.is_voice_input = True
-elif user_input:
-    active_input = user_input
-    st.session_state.is_voice_input = False
-else:
-    active_input = None
-
-# Handle state where only an image is uploaded (without text)
-if active_input or uploaded_image:
-    
-    # Default text fallback if only an image is uploaded
-    active_text = active_input if active_input else ""
-    if not active_text.strip() and uploaded_image is None:
-        st.warning("Please provide a text description, record audio, or upload a screenshot.")
-        st.stop()
-
-    content = []
-    
-    if active_text.strip():
-        content.append({"type": "text", "text": active_text})
-    elif uploaded_image:
-        # Provide the LLM with instructions if the user only provided an image
-        content.append({"type": "text", "text": "Please analyze this uploaded screenshot and assist me."})
-
-    if uploaded_image is not None:
-        base64_image = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-        })
-
-    st.session_state.messages.append({"role": "user", "content": content})
-
-    with st.chat_message("user"):
-        if active_text:
-            st.markdown(active_text)
-        elif uploaded_image:
-            st.markdown("*Uploaded an image.*")
-            
-        if uploaded_image is not None:
-            st.image(uploaded_image)
-
-    VISION_MODEL = "qwen/qwen3.6-27b" # Note: Ensure this model identifier matches Groq's exact current list!
-
-    with st.spinner("Analyzing request and executing tools..."):
-        try:
-            # ---- MULTI‑TURN TOOL EXECUTION LOOP ----
-            MAX_TURNS = 5
-            turn_count = 0
-
-            # Initial LLM call
-            response = client.chat.completions.create(
-                model=VISION_MODEL,
-                messages=st.session_state.messages,
-                tools=support_tools,
-                tool_choice="auto",
-                temperature=0.0
-            )
-
-            # We'll collect tool calls in this loop; final answer will be set when no tool_calls.
-            final_answer = None
-
-            while turn_count < MAX_TURNS:
-                response_message = response.choices[0].message
-                tool_calls = response_message.tool_calls
-
-                if tool_calls:
-                    # 1. Append assistant message with tool_calls
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                },
-                            }
-                            for tc in tool_calls
-                        ],
-                    }
-                    st.session_state.messages.append(assistant_msg)
-
-                    # Show a placeholder in the UI that tool calls are happening
-                    with st.chat_message("assistant"):
-                        st.info("🛠️ Tool call requested")
-
-                    # 2. Execute each tool and append results
-                    for tool_call in tool_calls:
-                        tool_name = tool_call.function.name
-                        tool_args = json.loads(tool_call.function.arguments)
-
-                        st.info(f"🛠️ **Agent Decision:** Trigger tool `{tool_name}` with parameters `{tool_args}`")
-
-                        with st.spinner(f"Executing `{tool_name}` on MCP Server..."):
-                            mcp_output = asyncio.run(execute_mcp_tool(tool_name, tool_args))
-
-                        # Safely convert tool responses to string to prevent API schema validation errors
-                        safe_mcp_output = str(mcp_output) if not isinstance(mcp_output, str) else mcp_output
-
-                        st.session_state.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": safe_mcp_output,
-                        })
-
-                        with st.expander(f"🔍 Developer Logs: Raw MCP Output ({tool_name})"):
-                            if isinstance(mcp_output, str) and mcp_output.startswith("ERROR:"):
-                                st.error(mcp_output)
-                            else:
-                                st.code(mcp_output)
-
-                    # 3. Next LLM call with the updated messages (including tool responses)
-                    response = client.chat.completions.create(
-                        model=VISION_MODEL,
-                        messages=st.session_state.messages,
-                        tools=support_tools,
-                        tool_choice="auto",
-                        temperature=0.0
-                    )
-                    turn_count += 1
-                    # Continue the loop to see if the LLM calls more tools
-
+            if st.button("Ingest Files", key="ingest_files"):
+                if not uploaded_kb_files:
+                    st.warning("Please select at least one file.")
+                elif supabase_client is None:
+                    st.error("Supabase client not available.")
                 else:
-                    # No tool_calls → final answer ready
-                    final_answer = response_message.content or ""
-                    st.session_state.messages.append({"role": "assistant", "content": final_answer})
-                    break
+                    with st.spinner("Extracting and embedding documents..."):
+                        embedder = load_embedder()
+                        for file in uploaded_kb_files:
+                            text_content = ""
+                            if file.name.endswith(".txt"):
+                                text_content = file.getvalue().decode("utf-8")
+                            elif file.name.endswith(".pdf"):
+                                reader = PdfReader(file)
+                                for page in reader.pages:
+                                    text_content += page.extract_text() + "\n"
+                            text_content = text_content.strip()
+                            if not text_content:
+                                continue
+                            
+                            # Chunk
+                            chunk_size = 1000
+                            chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
+                            for i, chunk in enumerate(chunks):
+                                if not chunk.strip():
+                                    continue
+                                embedding = embedder.encode(chunk).tolist()
+                                supabase_client.table("kb_articles").insert({
+                                    "title": f"{file.name} (Part {i+1})",
+                                    "content": chunk,
+                                    "embedding": embedding
+                                }).execute()
+                        st.success("✅ Files successfully ingested!")
+                        st.rerun()
 
+        # Column 2: Manage Content
+        with col2:
+            st.subheader("🗑️ Manage Content")
+            if supabase_client:
+                try:
+                    kb_res = supabase_client.table("kb_articles").select("id, title").order("id", desc=True).execute()
+                    if kb_res.data:
+                        kb_options = {f"[{item['id']}] {item['title']}": item['id'] for item in kb_res.data}
+                        selected_article = st.selectbox(
+                            "Select a document chunk to remove:",
+                            options=list(kb_options.keys()),
+                            key="kb_delete_select"
+                        )
+                        if st.button("Delete Selected", key="delete_kb_btn"):
+                            article_id = kb_options[selected_article]
+                            supabase_client.table("kb_articles").delete().eq("id", article_id).execute()
+                            st.success(f"✅ Deleted {selected_article}")
+                            st.rerun()
+                    else:
+                        st.info("Knowledge base is empty.")
+                except Exception as e:
+                    st.error(f"Error loading KB articles: {e}")
             else:
-                # Loop ended because MAX_TURNS reached without a final answer
-                st.warning(f"⚠️ Reached maximum tool call turns ({MAX_TURNS}). Showing partial response.")
-                # Use the last response content if available, otherwise a fallback
-                final_answer = response_message.content if response_message.content else "Max turns reached without final answer."
-                st.session_state.messages.append({"role": "assistant", "content": final_answer})
+                st.error("Database connection missing.")
 
-            # 4. Render the final assistant message (already appended) and handle TTS
-            if final_answer is not None:
-                with st.chat_message("assistant"):
-                    st.markdown(final_answer)
-                    if st.session_state.get("is_voice_input", False):
-                        with st.spinner("Generating voice response..."):
-                            audio_fp = generate_tts_audio(final_answer)
-                            if audio_fp:
-                                st.audio(audio_fp, format="audio/mp3", autoplay=True)
-                        st.session_state.is_voice_input = False
+    # ---------- TAB 3: System Status ----------
+    with tab3:
+        st.subheader("🖥️ System Status")
+        st.markdown("**Supabase Connection:**")
+        if supabase_client:
+            st.success("✅ Connected")
+        else:
+            st.error("❌ Not connected")
+        
+        st.markdown("**Groq API Key:**")
+        if api_key:
+            st.success("✅ Loaded")
+        else:
+            st.error("❌ Missing")
+        
+        st.markdown("**MCP Server:**")
+        st.success("✅ Ready (server.py expected)")
+        
+        st.markdown("**Environment:**")
+        st.json(env_status)
 
-        except Exception as e:
-            st.error(f"❌ **API Error:** {str(e)}")
+# ------------------------------------------------------------------------------
+# RENDER EITHER DASHBOARD OR CHAT
+# ------------------------------------------------------------------------------
+if st.session_state.is_agent:
+    render_admin_dashboard()
+    # Do NOT show chat interface
+else:
+    # ---------- CHAT INTERFACE (existing code) ----------
+    def render_message_content(content):
+        if isinstance(content, str):
+            st.markdown(content)
+        elif isinstance(content, list):
+            for item in content:
+                if item.get("type") == "text":
+                    st.markdown(item.get("text", ""))
+                elif item.get("type") == "image_url":
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:image"):
+                        _, encoded = image_url.split(",", 1)
+                        image_bytes = base64.b64decode(encoded)
+                        st.image(image_bytes)
+                    else:
+                        st.image(image_url)
+
+    for message in st.session_state.messages:
+        if message.get("role") in ["tool", "system"]:
+            continue
+        with st.chat_message(message["role"]):
+            render_message_content(message.get("content"))
+
+    uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
+    user_input = st.chat_input("Describe your issue...")
+    voice_input = None
+
+    # Process voice input from sidebar (audio_bytes is defined in sidebar)
+    if 'audio_bytes' in locals() and audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
+        st.session_state.last_audio = audio_bytes
+        with st.spinner("Transcribing audio..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                tmp_file.write(audio_bytes)
+                tmp_path = tmp_file.name
+            with open(tmp_path, "rb") as f:
+                transcription = client.audio.transcriptions.create(
+                    file=("audio.wav", f.read()),
+                    model="whisper-large-v3-turbo",
+                )
+            voice_input = transcription.text
+            os.remove(tmp_path)
+            st.toast(f"Transcribed: {voice_input}")
+
+    # Determine active input
+    if voice_input:
+        active_input = voice_input
+        st.session_state.is_voice_input = True
+    elif user_input:
+        active_input = user_input
+        st.session_state.is_voice_input = False
+    else:
+        active_input = None
+
+    if active_input or uploaded_image:
+        active_text = active_input if active_input else ""
+        if not active_text.strip() and uploaded_image is None:
+            st.warning("Please provide a text description, record audio, or upload a screenshot.")
+            st.stop()
+
+        content = []
+        if active_text.strip():
+            content.append({"type": "text", "text": active_text})
+        elif uploaded_image:
+            content.append({"type": "text", "text": "Please analyze this uploaded screenshot and assist me."})
+
+        if uploaded_image is not None:
+            base64_image = base64.b64encode(uploaded_image.getvalue()).decode("utf-8")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+            })
+
+        st.session_state.messages.append({"role": "user", "content": content})
+
+        with st.chat_message("user"):
+            if active_text:
+                st.markdown(active_text)
+            elif uploaded_image:
+                st.markdown("*Uploaded an image.*")
+            if uploaded_image is not None:
+                st.image(uploaded_image)
+
+        VISION_MODEL = "qwen/qwen3.6-27b"
+
+        with st.spinner("Analyzing request and executing tools..."):
+            try:
+                MAX_TURNS = 5
+                turn_count = 0
+                response = client.chat.completions.create(
+                    model=VISION_MODEL,
+                    messages=st.session_state.messages,
+                    tools=support_tools,
+                    tool_choice="auto",
+                    temperature=0.0
+                )
+                final_answer = None
+
+                while turn_count < MAX_TURNS:
+                    response_message = response.choices[0].message
+                    tool_calls = response_message.tool_calls
+
+                    if tool_calls:
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in tool_calls
+                            ],
+                        }
+                        st.session_state.messages.append(assistant_msg)
+                        with st.chat_message("assistant"):
+                            st.info("🛠️ Tool call requested")
+
+                        for tool_call in tool_calls:
+                            tool_name = tool_call.function.name
+                            tool_args = json.loads(tool_call.function.arguments)
+                            st.info(f"🛠️ **Agent Decision:** Trigger tool `{tool_name}` with parameters `{tool_args}`")
+                            with st.spinner(f"Executing `{tool_name}` on MCP Server..."):
+                                mcp_output = asyncio.run(execute_mcp_tool(tool_name, tool_args))
+                            safe_mcp_output = str(mcp_output) if not isinstance(mcp_output, str) else mcp_output
+                            st.session_state.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_name,
+                                "content": safe_mcp_output,
+                            })
+                            with st.expander(f"🔍 Developer Logs: Raw MCP Output ({tool_name})"):
+                                if isinstance(mcp_output, str) and mcp_output.startswith("ERROR:"):
+                                    st.error(mcp_output)
+                                else:
+                                    st.code(mcp_output)
+
+                        response = client.chat.completions.create(
+                            model=VISION_MODEL,
+                            messages=st.session_state.messages,
+                            tools=support_tools,
+                            tool_choice="auto",
+                            temperature=0.0
+                        )
+                        turn_count += 1
+                    else:
+                        final_answer = response_message.content or ""
+                        st.session_state.messages.append({"role": "assistant", "content": final_answer})
+                        break
+                else:
+                    st.warning(f"⚠️ Reached maximum tool call turns ({MAX_TURNS}). Showing partial response.")
+                    final_answer = response_message.content if response_message.content else "Max turns reached without final answer."
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer})
+
+                if final_answer is not None:
+                    with st.chat_message("assistant"):
+                        st.markdown(final_answer)
+                        if st.session_state.get("is_voice_input", False):
+                            with st.spinner("Generating voice response..."):
+                                audio_fp = generate_tts_audio(final_answer)
+                                if audio_fp:
+                                    st.audio(audio_fp, format="audio/mp3", autoplay=True)
+                            st.session_state.is_voice_input = False
+
+            except Exception as e:
+                st.error(f"❌ **API Error:** {str(e)}")

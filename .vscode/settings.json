@@ -1,0 +1,13 @@
+{
+  "python.defaultInterpreterPath": "e:/WORK and STUDIES/Projects/mcp-portfolio-project/.venv/Scripts/python.exe",
+  "python.analysis.defaultInterpreterPath": "e:/WORK and STUDIES/Projects/mcp-portfolio-project/.venv/Scripts/python.exe",
+  "python.languageServer": "Pylance",
+  "python.analysis.typeCheckingMode": "off",
+  "python.analysis.logLevel": "Error",
+  "python.analysis.indexing": true,
+  "python.analysis.useLibraryCodeForTypes": true,
+  "python.analysis.packageIndexDepths": {
+    "default": 2
+  },
+  "python.analysis.completeFunctionParens": true
+}
