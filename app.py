@@ -5,6 +5,7 @@ import base64
 import tempfile
 import io
 import re
+from datetime import datetime, timedelta
 
 import streamlit as st
 from fastmcp import Client
@@ -16,32 +17,31 @@ from supabase import create_client
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-# Propagate Supabase secrets into the process environment so the MCP server can access them.
+# -------------------------------------------------------------------
+# 1. Environment & Supabase client
+# -------------------------------------------------------------------
 if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
     os.environ["SUPABASE_URL"] = st.secrets["SUPABASE_URL"]
     os.environ["SUPABASE_KEY"] = st.secrets["SUPABASE_KEY"]
-    st.info("✅ Supabase credentials loaded from st.secrets into process environment.")
 else:
     st.warning("⚠️ Supabase keys missing from st.secrets! Check .streamlit/secrets.toml")
 
-# Initialize Supabase client for the frontend dashboard
 supabase_client = None
 if "SUPABASE_URL" in os.environ and "SUPABASE_KEY" in os.environ:
     supabase_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-# Diagnostic environment reporting
 env_status = {
     "SUPABASE_URL": "SUPABASE_URL" in os.environ,
     "SUPABASE_KEY": "SUPABASE_KEY" in os.environ,
 }
-st.write(f"Debug: SUPABASE_URL set = {env_status['SUPABASE_URL']}, SUPABASE_KEY set = {env_status['SUPABASE_KEY']}")
 
+# -------------------------------------------------------------------
+# 2. Embedder & Groq
+# -------------------------------------------------------------------
 @st.cache_resource
 def load_embedder():
-    """Caches the embedding model so it doesn't reload on every UI click."""
     return SentenceTransformer('all-MiniLM-L6-v2')
 
-# 1. Setup Groq API Key
 try:
     api_key = st.secrets["GROQ_API_KEY"]
 except (FileNotFoundError, KeyError, Exception):
@@ -57,26 +57,24 @@ st.set_page_config(page_title="Omni-Support AI", layout="centered", page_icon="�
 st.title("⚡ IT Support Agent (Groq Edition)")
 st.caption("Powered by Llama 3.2 Vision & Model Context Protocol (MCP)")
 
-# 2. TTS Helper Functions
+# -------------------------------------------------------------------
+# 3. TTS helpers
+# -------------------------------------------------------------------
 def clean_text_for_speech(text: str, max_chars: int = 350) -> str:
-    """Strips markdown formatting/code and limits length to prevent Google TTS rate limits."""
     text = re.sub(r'```[\s\S]*?```', ' Code snippet omitted. ', text)
     text = re.sub(r'`[^`]*`', '', text)
     text = re.sub(r'http[s]?://\S+', '', text)
     text = re.sub(r'[\*#_~]', '', text)
     text = re.sub(r'\n+', ' ', text).strip()
-    
     if len(text) > max_chars:
         text = text[:max_chars].rsplit(' ', 1)[0] + "... Please see screen for full details."
     return text
 
 def generate_tts_audio(text: str) -> io.BytesIO | None:
-    """Safely converts text to an in-memory MP3 stream using gTTS with error fallback."""
     try:
         cleaned_text = clean_text_for_speech(text)
         if not cleaned_text:
             cleaned_text = "Here is the summary of your request."
-        
         tts = gTTS(text=cleaned_text, lang="en", tld="com")
         audio_fp = io.BytesIO()
         tts.write_to_fp(audio_fp)
@@ -86,7 +84,9 @@ def generate_tts_audio(text: str) -> io.BytesIO | None:
         st.warning(f"⚠️ Voice output unavailable: {str(e)}")
         return None
 
-# 3. Async MCP Execution with explicit subprocess environment inheritance
+# -------------------------------------------------------------------
+# 4. MCP tool execution
+# -------------------------------------------------------------------
 async def execute_mcp_tool(tool_name: str, tool_args: dict):
     mcp_env = os.environ.copy()
     transport = PythonStdioTransport("server.py", env=mcp_env)
@@ -95,7 +95,9 @@ async def execute_mcp_tool(tool_name: str, tool_args: dict):
         result = await mcp_client.call_tool(tool_name, tool_args)
         return result.data
 
-# 4. Define Tools using the standard OpenAI/Groq JSON Schema
+# -------------------------------------------------------------------
+# 5. Tool definitions
+# -------------------------------------------------------------------
 support_tools = [
     {
         "type": "function",
@@ -104,9 +106,7 @@ support_tools = [
             "description": "Retrieves the status of a specific support ticket by its ID.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "ticket_id": {"type": "integer"}
-                },
+                "properties": {"ticket_id": {"type": "integer"}},
                 "required": ["ticket_id"]
             }
         }
@@ -133,12 +133,7 @@ support_tools = [
             "description": "Retrieves a list of the most recent support tickets to summarize the current queue.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "default": 5
-                    }
-                }
+                "properties": {"limit": {"type": "integer", "default": 5}}
             }
         }
     },
@@ -149,9 +144,7 @@ support_tools = [
             "description": "Retrieves all past and present support tickets for a specific user email.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "email": {"type": "string"}
-                },
+                "properties": {"email": {"type": "string"}},
                 "required": ["email"]
             }
         }
@@ -163,9 +156,7 @@ support_tools = [
             "description": "Searches the company's internal IT knowledge base for troubleshooting steps, setup guides, and policies. Always use this BEFORE searching the public web.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query based on the user's issue."}
-                },
+                "properties": {"query": {"type": "string", "description": "The search query based on the user's issue."}},
                 "required": ["query"]
             }
         }
@@ -177,131 +168,147 @@ support_tools = [
             "description": "Search the web using DuckDuckGo to find real-time information, technical documentation, or troubleshooting guides.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query string"}
-                },
+                "properties": {"query": {"type": "string", "description": "The search query string"}},
                 "required": ["query"]
             }
         }
     }
 ]
 
-# 5. Streamlit UI Elements & State Initialization
-if "user_email" not in st.session_state:
-    st.session_state.user_email = None
-
-# --- NEW: The Login Wall ---
-if not st.session_state.user_email:
-    st.markdown("## 👋 Welcome to Omni-Support")
-    st.markdown("Please sign in to access your support history and create new tickets.")
-    
-    with st.form("login_form"):
-        email_input = st.text_input("Email Address", placeholder="name@company.com")
-        submit_btn = st.form_submit_button("Start Chat")
-        
-        if submit_btn and email_input:
-            st.session_state.user_email = email_input
-            st.rerun()
-            
-    st.stop() # This stops the rest of the app from loading until they log in!
-
-# Updated system prompt with explicit tool‑usage rules
-SYSTEM_PROMPT_TEMPLATE = (
-    "You are a helpful IT support agent. You are talking to user: {user_email}. "
-    "Always use this email when creating tickets or looking up their history.\n"
-    "Tool usage rules:\n"
-    "1. Always search the internal knowledge base first using `search_knowledge_base`.\n"
-    "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
-)
-
+# -------------------------------------------------------------------
+# 6. Session state initialisation
+# -------------------------------------------------------------------
+if "user_session" not in st.session_state:
+    st.session_state.user_session = None
+if "user_role" not in st.session_state:
+    st.session_state.user_role = None
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT_TEMPLATE.format(user_email=st.session_state.user_email)
-        }
-    ]
-
+    st.session_state.messages = []
 if "is_voice_input" not in st.session_state:
     st.session_state.is_voice_input = False
 
-if "is_agent" not in st.session_state:
-    st.session_state.is_agent = False
+# -------------------------------------------------------------------
+# 7. Authentication helper functions
+# -------------------------------------------------------------------
+def sign_in(email: str, password: str):
+    try:
+        res = supabase_client.auth.sign_in_with_password({"email": email, "password": password})
+        return res
+    except Exception as e:
+        st.error(f"Login failed: {str(e)}")
+        return None
 
-# ------------------------------------------------------------------------------
-# SIDEBAR – now only contains login/logout and (optionally) clear chat
-# ------------------------------------------------------------------------------
+def sign_up(email: str, password: str):
+    try:
+        res = supabase_client.auth.sign_up({"email": email, "password": password})
+        return res
+    except Exception as e:
+        st.error(f"Sign-up failed: {str(e)}")
+        return None
+
+def get_user_profile(user_id: str):
+    try:
+        res = supabase_client.table("user_profiles").select("role").eq("id", user_id).execute()
+        if res.data:
+            return res.data[0].get("role", "user")
+        else:
+            # No profile yet – create one with default role 'user'
+            supabase_client.table("user_profiles").insert({"id": user_id, "role": "user"}).execute()
+            return "user"
+    except Exception as e:
+        st.error(f"Failed to fetch user role: {e}")
+        return "user"
+
+def sign_out():
+    supabase_client.auth.sign_out()
+    st.session_state.user_session = None
+    st.session_state.user_role = None
+    st.session_state.messages = []
+    st.rerun()
+
+# -------------------------------------------------------------------
+# 8. Login / Signup screen (shown when not authenticated)
+# -------------------------------------------------------------------
+if not st.session_state.user_session:
+    st.markdown("## 👋 Welcome to Omni-Support")
+    st.markdown("Please sign in or create an account.")
+
+    mode = st.radio("", ["Login", "Sign Up"], horizontal=True)
+    with st.form("auth_form"):
+        email = st.text_input("Email", placeholder="your@email.com")
+        password = st.text_input("Password", type="password", placeholder="••••••••")
+        submit = st.form_submit_button("Continue")
+
+        if submit:
+            if not email or not password:
+                st.warning("Please fill in all fields.")
+            elif mode == "Login":
+                res = sign_in(email, password)
+                if res:
+                    st.session_state.user_session = res
+                    st.session_state.user_role = get_user_profile(res.user.id)
+                    st.rerun()
+            else:  # Sign Up
+                res = sign_up(email, password)
+                if res:
+                    # After sign-up, automatically create profile and log in
+                    st.session_state.user_session = res
+                    st.session_state.user_role = get_user_profile(res.user.id)
+                    st.success("Account created! You are now logged in.")
+                    st.rerun()
+    st.stop()
+
+# -------------------------------------------------------------------
+# 9. Once authenticated: show sidebar with user info & sign out
+# -------------------------------------------------------------------
+user_email = st.session_state.user_session.user.email
+is_agent = (st.session_state.user_role == "agent")
+
 with st.sidebar:
-    st.markdown("### Controls")
-    # Show Clear Chat only when NOT in agent mode (i.e., user chat is visible)
-    if not st.session_state.is_agent:
+    st.markdown(f"**👤 {user_email}**")
+    if is_agent:
+        st.badge("Agent", color="green")
+    else:
+        st.badge("User", color="blue")
+
+    if st.button("🚪 Sign Out"):
+        sign_out()
+
+    st.divider()
+
+    if not is_agent:
+        # User mode: show clear chat and voice recorder
         if st.button("Clear Chat"):
-            st.session_state.messages = [
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT_TEMPLATE.format(user_email=st.session_state.user_email)
-                }
-            ]
-            st.session_state.is_voice_input = False
+            st.session_state.messages = []
             st.rerun()
         st.divider()
         st.markdown("### 🎤 Voice Input")
         audio_bytes = audio_recorder(text="Click to record...", icon_size="2x")
     else:
-        # Agent mode: show logout only
-        st.markdown("### 🔒 Agent Portal")
-        if st.button("Log Out Agent"):
-            st.session_state.is_agent = False
-            st.rerun()
-        st.divider()
-        st.markdown("✅ Logged in as **Agent**")
+        # Agent mode: no extra controls (dashboard takes over)
+        st.markdown("✅ **Agent Dashboard active**")
 
-    # Always show the agent login box (if not already agent)
-    if not st.session_state.is_agent:
-        st.divider()
-        st.markdown("### 🔒 Agent Portal")
-        st.caption("Staff only. Enter PIN to view queue.")
-        agent_pin = st.text_input("PIN", type="password", key="pin_input", placeholder="Enter PIN")
-        correct_pin = st.secrets.get("AGENT_PIN", "0000")
-        if st.button("Login", key="agent_login_btn"):
-            if agent_pin == correct_pin:
-                st.session_state.is_agent = True
-                st.rerun()
-            else:
-                st.error("Invalid PIN.")
-
-# ------------------------------------------------------------------------------
-# MAIN AREA – decide what to render based on agent status
-# ------------------------------------------------------------------------------
-
-def render_admin_dashboard():
-    """Dedicated admin dashboard with tabs and full-screen layout."""
+# -------------------------------------------------------------------
+# 10. Define render functions for agent dashboard and chat
+# -------------------------------------------------------------------
+def render_agent_dashboard():
+    """Full‑screen agent dashboard with three tabs."""
     st.markdown("## 🛠️ Agent Dashboard")
-    
-    # Create three tabs
+
     tab1, tab2, tab3 = st.tabs(["🎫 Ticket Queue", "📚 Knowledge Base", "⚙️ System Status"])
 
-    # ---------- TAB 1: Ticket Queue ----------
+    # ---------- TAB 1: Ticket Queue + Manage ----------
     with tab1:
         # Metrics row
         col1, col2, col3 = st.columns(3)
-        total_tickets = 0
-        recent_tickets = 0
-        open_tickets = 0
-
+        total_tickets = recent_tickets = open_tickets = 0
         if supabase_client:
             try:
-                # Get total count
                 total_res = supabase_client.table("tickets").select("*", count="exact").execute()
                 total_tickets = total_res.count if hasattr(total_res, 'count') else len(total_res.data)
-                
-                # Get recent (last 24h)
-                from datetime import datetime, timedelta
                 yesterday = (datetime.now() - timedelta(days=1)).isoformat()
                 recent_res = supabase_client.table("tickets").select("*", count="exact").gt("created_at", yesterday).execute()
                 recent_tickets = recent_res.count if hasattr(recent_res, 'count') else len(recent_res.data)
-
-                # Get open tickets (status != 'closed')
                 open_res = supabase_client.table("tickets").select("*", count="exact").neq("status", "closed").execute()
                 open_tickets = open_res.count if hasattr(open_res, 'count') else len(open_res.data)
             except Exception as e:
@@ -311,10 +318,11 @@ def render_admin_dashboard():
         col2.metric("🕒 New (24h)", recent_tickets)
         col3.metric("🟢 Open Tickets", open_tickets)
 
-        # Refresh button and table
+        # Refresh button
         if st.button("🔄 Refresh Queue", key="refresh_queue"):
             st.rerun()
-        
+
+        # Full ticket table
         if supabase_client:
             try:
                 res = supabase_client.table("tickets").select("*").order("id", desc=True).execute()
@@ -327,11 +335,69 @@ def render_admin_dashboard():
         else:
             st.error("Database connection missing.")
 
+        # ---------- Manage Ticket section ----------
+        st.divider()
+        st.subheader("📝 Manage Ticket")
+
+        if supabase_client:
+            # Get list of ticket IDs for selection
+            try:
+                id_res = supabase_client.table("tickets").select("id").order("id", desc=True).execute()
+                ticket_ids = [str(t["id"]) for t in id_res.data] if id_res.data else []
+            except Exception:
+                ticket_ids = []
+
+            if ticket_ids:
+                selected_id_str = st.selectbox("Select a ticket by ID:", ticket_ids, key="ticket_selector")
+                if selected_id_str:
+                    ticket_id = int(selected_id_str)
+                    # Fetch ticket details
+                    try:
+                        detail_res = supabase_client.table("tickets").select("*").eq("id", ticket_id).execute()
+                        if detail_res.data:
+                            ticket = detail_res.data[0]
+                            st.text(f"**User Email:** {ticket.get('user_email', 'N/A')}")
+                            st.text(f"**Description:** {ticket.get('description', 'N/A')}")
+                            st.text(f"**Current Status:** {ticket.get('status', 'N/A')}")
+                            st.text(f"**Created At:** {ticket.get('created_at', 'N/A')}")
+                            st.text(f"**Internal Notes:** {ticket.get('internal_notes', '')}")
+
+                            # Update controls
+                            new_status = st.selectbox(
+                                "Update Status",
+                                ["Open", "In Progress", "Resolved", "Closed"],
+                                index=["Open", "In Progress", "Resolved", "Closed"].index(ticket.get("status", "Open")),
+                                key="status_update"
+                            )
+                            new_notes = st.text_area(
+                                "Internal Notes (append or overwrite)",
+                                value=ticket.get("internal_notes", ""),
+                                key="notes_update"
+                            )
+
+                            if st.button("✏️ Update Ticket", key="update_ticket_btn"):
+                                try:
+                                    supabase_client.table("tickets").update({
+                                        "status": new_status,
+                                        "internal_notes": new_notes
+                                    }).eq("id", ticket_id).execute()
+                                    st.toast("✅ Ticket updated successfully!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Update failed: {e}")
+                        else:
+                            st.info("Ticket not found.")
+                    except Exception as e:
+                        st.error(f"Could not load ticket details: {e}")
+            else:
+                st.info("No tickets to manage.")
+        else:
+            st.error("Database connection missing.")
+
     # ---------- TAB 2: Knowledge Base Management ----------
     with tab2:
         col1, col2 = st.columns(2)
-        
-        # Column 1: Add Content
+
         with col1:
             st.subheader("📥 Add Content")
             uploaded_kb_files = st.file_uploader(
@@ -359,8 +425,6 @@ def render_admin_dashboard():
                             text_content = text_content.strip()
                             if not text_content:
                                 continue
-                            
-                            # Chunk
                             chunk_size = 1000
                             chunks = [text_content[i:i+chunk_size] for i in range(0, len(text_content), chunk_size)]
                             for i, chunk in enumerate(chunks):
@@ -375,7 +439,6 @@ def render_admin_dashboard():
                         st.success("✅ Files successfully ingested!")
                         st.rerun()
 
-        # Column 2: Manage Content
         with col2:
             st.subheader("🗑️ Manage Content")
             if supabase_client:
@@ -408,54 +471,62 @@ def render_admin_dashboard():
             st.success("✅ Connected")
         else:
             st.error("❌ Not connected")
-        
         st.markdown("**Groq API Key:**")
         if api_key:
             st.success("✅ Loaded")
         else:
             st.error("❌ Missing")
-        
         st.markdown("**MCP Server:**")
         st.success("✅ Ready (server.py expected)")
-        
         st.markdown("**Environment:**")
         st.json(env_status)
 
-# ------------------------------------------------------------------------------
-# RENDER EITHER DASHBOARD OR CHAT
-# ------------------------------------------------------------------------------
-if st.session_state.is_agent:
-    render_admin_dashboard()
-    # Do NOT show chat interface
-else:
-    # ---------- CHAT INTERFACE (existing code) ----------
-    def render_message_content(content):
-        if isinstance(content, str):
-            st.markdown(content)
-        elif isinstance(content, list):
-            for item in content:
-                if item.get("type") == "text":
-                    st.markdown(item.get("text", ""))
-                elif item.get("type") == "image_url":
-                    image_url = item.get("image_url", {}).get("url", "")
-                    if image_url.startswith("data:image"):
-                        _, encoded = image_url.split(",", 1)
-                        image_bytes = base64.b64decode(encoded)
-                        st.image(image_bytes)
-                    else:
-                        st.image(image_url)
+# -------------------------------------------------------------------
+# 11. Chat interface (for non‑agent users)
+# -------------------------------------------------------------------
+def render_user_chat():
+    # System prompt uses the authenticated user's email
+    system_prompt = (
+        f"You are a helpful IT support agent. You are talking to user: {user_email}. "
+        "Always use this email when creating tickets or looking up their history.\n"
+        "Tool usage rules:\n"
+        "1. Always search the internal knowledge base first using `search_knowledge_base`.\n"
+        "2. IF `search_knowledge_base` returns no relevant results or fails, you MUST immediately call `web_search` to find the solution on the public web."
+    )
 
+    # Initialise messages if empty or if system prompt changed (e.g., after login)
+    if not st.session_state.messages:
+        st.session_state.messages = [{"role": "system", "content": system_prompt}]
+    elif st.session_state.messages[0]["content"] != system_prompt:
+        # Update system prompt if user changed (should not happen within a session)
+        st.session_state.messages[0] = {"role": "system", "content": system_prompt}
+
+    # Display chat history (skip system and tool messages)
     for message in st.session_state.messages:
         if message.get("role") in ["tool", "system"]:
             continue
         with st.chat_message(message["role"]):
-            render_message_content(message.get("content"))
+            if isinstance(message.get("content"), str):
+                st.markdown(message["content"])
+            elif isinstance(message.get("content"), list):
+                for item in message["content"]:
+                    if item.get("type") == "text":
+                        st.markdown(item.get("text", ""))
+                    elif item.get("type") == "image_url":
+                        image_url = item.get("image_url", {}).get("url", "")
+                        if image_url.startswith("data:image"):
+                            _, encoded = image_url.split(",", 1)
+                            image_bytes = base64.b64decode(encoded)
+                            st.image(image_bytes)
+                        else:
+                            st.image(image_url)
 
+    # Input area
     uploaded_image = st.file_uploader("Upload Error Screenshot", type=["png", "jpg", "jpeg"])
     user_input = st.chat_input("Describe your issue...")
     voice_input = None
 
-    # Process voice input from sidebar (audio_bytes is defined in sidebar)
+    # Voice input from sidebar
     if 'audio_bytes' in locals() and audio_bytes and ("last_audio" not in st.session_state or st.session_state.last_audio != audio_bytes):
         st.session_state.last_audio = audio_bytes
         with st.spinner("Transcribing audio..."):
@@ -510,7 +581,7 @@ else:
             if uploaded_image is not None:
                 st.image(uploaded_image)
 
-        VISION_MODEL = "qwen/qwen3.6-27b"
+        VISION_MODEL = "qwen/qwen3.6-27b"  # Ensure this model is available
 
         with st.spinner("Analyzing request and executing tools..."):
             try:
@@ -597,3 +668,11 @@ else:
 
             except Exception as e:
                 st.error(f"❌ **API Error:** {str(e)}")
+
+# -------------------------------------------------------------------
+# 12. Main routing: agent dashboard vs user chat
+# -------------------------------------------------------------------
+if is_agent:
+    render_agent_dashboard()
+else:
+    render_user_chat()
